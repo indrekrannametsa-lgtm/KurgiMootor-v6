@@ -378,7 +378,7 @@ class WeatherService:
         result = []
         for year, month in self._month_ranges(start_day, end_day):
             params = {
-                "jaam_nimi": f"ilike.*{station_fragment}*",
+                "jaam_nimi": f"like.*{station_fragment}*",
                 "aasta": f"eq.{year}",
                 "kuu": f"eq.{month}",
                 "select": (
