@@ -342,7 +342,7 @@ class KurgiDB:
 class WeatherService:
     OFFICIAL_BASE = "https://keskkonnaandmed.envir.ee/f_kliima_paev"
     OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-    HEADERS = {"Accept-Profile": "apijahialad","Accept": "application/json"}
+    HEADERS = {"Accept-Profile": "apijahiala","Accept": "application/json"}
 
     # Farm-area coordinates; forecast is not presented as a station measurement.
     FORECAST_LAT = 58.13
