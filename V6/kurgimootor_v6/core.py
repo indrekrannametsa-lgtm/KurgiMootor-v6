@@ -393,7 +393,7 @@ class WeatherService:
                 headers=self.HEADERS,
                 timeout=30,
             )
-            response.raise_for_status()
+            if not response.ok: raise RuntimeError(f"Keskkonnaandmete API{response.status_code}:{response.text}")
             payload = response.json()
             if not isinstance(payload, list):
                 raise ValueError("Ametlik ilma-API ei tagastanud kirjete loendit.")
