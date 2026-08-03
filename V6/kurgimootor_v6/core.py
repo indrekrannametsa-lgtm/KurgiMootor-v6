@@ -383,7 +383,7 @@ class WeatherService:
                 "kuu": f"eq.{month}",
                 "select": (
                     "jaam_kood,jaam_nimi,aasta,kuu,paev,vaartus,"
-                    "element_kood,element_nimi,element_yhik,avaandmed_ts"
+                    "element_kood,element_nimi,element_yhik"
                 ),
                 "order": "paev.asc,element_kood.asc",
             }
