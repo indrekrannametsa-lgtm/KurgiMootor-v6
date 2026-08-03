@@ -234,10 +234,80 @@ as $$
     limit greatest(1, least(p_limit, 2000));
 $$;
 
+
+
+create table if not exists public.weather_daily (
+    weather_date date primary key,
+    source_station text not null default 'Häädemeeste',
+
+    temp_avg_c numeric(6,2),
+    temp_min_c numeric(6,2),
+    temp_max_c numeric(6,2),
+    humidity_avg_pct numeric(6,2) check (humidity_avg_pct between 0 and 100),
+    humidity_min_pct numeric(6,2) check (humidity_min_pct between 0 and 100),
+    humidity_max_pct numeric(6,2) check (humidity_max_pct between 0 and 100),
+    precipitation_mm numeric(10,2) check (precipitation_mm >= 0),
+
+    wind_avg_ms numeric(7,2) check (wind_avg_ms >= 0),
+    wind_max_ms numeric(7,2) check (wind_max_ms >= 0),
+    wind_gust_ms numeric(7,2) check (wind_gust_ms >= 0),
+    wind_direction_deg numeric(6,2) check (wind_direction_deg >= 0 and wind_direction_deg <= 360),
+
+    pressure_avg_hpa numeric(8,2),
+    dewpoint_avg_c numeric(6,2),
+    sunshine_hours numeric(6,2) check (sunshine_hours >= 0),
+
+    radiation_mj_m2 numeric(10,2) check (radiation_mj_m2 >= 0),
+    radiation_station text not null default 'Pärnu',
+
+    notes text,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+create or replace function public.get_weather_status(
+    p_weather_date date
+)
+returns table (
+    weather_date date,
+    is_complete boolean,
+    missing_fields text[]
+)
+language sql
+security definer
+set search_path = public
+as $$
+    select
+        p_weather_date,
+        (
+            w.temp_avg_c is not null
+            and w.temp_min_c is not null
+            and w.temp_max_c is not null
+            and w.humidity_avg_pct is not null
+            and w.precipitation_mm is not null
+            and w.wind_avg_ms is not null
+            and w.wind_gust_ms is not null
+            and w.radiation_mj_m2 is not null
+        ) as is_complete,
+        array_remove(array[
+            case when w.temp_avg_c is null then 'Keskmine temperatuur' end,
+            case when w.temp_min_c is null then 'Miinimumtemperatuur' end,
+            case when w.temp_max_c is null then 'Maksimumtemperatuur' end,
+            case when w.humidity_avg_pct is null then 'Keskmine õhuniiskus' end,
+            case when w.precipitation_mm is null then 'Sademed' end,
+            case when w.wind_avg_ms is null then 'Keskmine tuulekiirus' end,
+            case when w.wind_gust_ms is null then 'Maksimaalne puhang' end,
+            case when w.radiation_mj_m2 is null then 'Globaalradiatsioon' end
+        ], null) as missing_fields
+    from (select 1) seed
+    left join public.weather_daily w on w.weather_date = p_weather_date;
+$$;
+
 alter table public.fields enable row level security;
 alter table public.daily_plan enable row level security;
 alter table public.plan_days enable row level security;
 alter table public.harvests enable row level security;
+alter table public.weather_daily enable row level security;
 
 revoke all on public.fields from anon, authenticated;
 revoke all on public.daily_plan from anon, authenticated;

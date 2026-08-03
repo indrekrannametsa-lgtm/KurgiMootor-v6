@@ -131,3 +131,38 @@ def get_harvest_history(limit: int = 300) -> List[Dict[str, Any]]:
         .rpc("get_harvest_history", {"p_limit": int(limit)})
     )
     return list(response.data or [])
+
+
+
+def get_weather_for_day(day: date) -> Dict[str, Any] | None:
+    response = _execute(
+        _client()
+        .table("weather_daily")
+        .select("*")
+        .eq("weather_date", day.isoformat())
+        .limit(1)
+    )
+    rows = list(response.data or [])
+    return rows[0] if rows else None
+
+
+def save_weather(day: date, values: Dict[str, Any]) -> None:
+    payload: Dict[str, Any] = {"weather_date": day.isoformat()}
+    for key, value in values.items():
+        payload[key] = value if value not in ("",) else None
+
+    _execute(
+        _client()
+        .table("weather_daily")
+        .upsert(payload, on_conflict="weather_date")
+    )
+
+
+def get_weather_status(day: date) -> Dict[str, Any]:
+    response = _execute(
+        _client().rpc("get_weather_status", {"p_weather_date": day.isoformat()})
+    )
+    rows = list(response.data or [])
+    if not rows:
+        return {"weather_date": day.isoformat(), "is_complete": False, "missing_fields": []}
+    return rows[0]

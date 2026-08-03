@@ -15,6 +15,9 @@ from db import (
     get_used_interval,
     remove_plan_field,
     save_harvest,
+    get_weather_for_day,
+    get_weather_status,
+    save_weather,
 )
 
 st.set_page_config(
@@ -44,6 +47,11 @@ st.markdown(
 TODAY = date.today()
 
 
+def optional_number(container, label: str, current, **kwargs):
+    value = None if current is None else float(current)
+    return container.number_input(label, value=value, **kwargs)
+
+
 def rerun() -> None:
     st.rerun()
 
@@ -67,7 +75,7 @@ except DatabaseError as exc:
     show_database_error(exc)
     st.stop()
 
-tab_today, tab_history = st.tabs(["Täna", "Korjeajalugu"])
+tab_today, tab_weather, tab_history = st.tabs(["Täna", "Ilmaandmed", "Korjeajalugu"])
 
 with tab_today:
     st.subheader("Täna korjatavad põllud")
@@ -205,6 +213,98 @@ with tab_today:
                 show_database_error(exc)
     else:
         st.info("Korjete sisestamiseks lisa tänasesse plaani vähemalt üks põld.")
+
+
+with tab_weather:
+    st.subheader("Ilmaandmed")
+    st.caption(
+        "Häädemeeste jaam on põhiallikas. Globaalradiatsioon võetakse Pärnu jaamast. "
+        "Korjeandmed ei ole prognoosi avamise tingimus."
+    )
+
+    weather_day = st.date_input("Kuupäev", value=TODAY, key="weather_day")
+
+    try:
+        existing_weather = get_weather_for_day(weather_day) or {}
+        status = get_weather_status(weather_day)
+    except DatabaseError as exc:
+        show_database_error(exc)
+        existing_weather = {}
+        status = {"is_complete": False, "missing_fields": []}
+
+    if bool(status.get("is_complete")):
+        st.success("Ilmaandmed on prognoosi jaoks täielikud.")
+    else:
+        missing = status.get("missing_fields") or []
+        if missing:
+            st.warning("Prognoosi jaoks puudub: " + ", ".join(str(x) for x in missing))
+        else:
+            st.warning("Selle kuupäeva ilmaandmed pole veel sisestatud.")
+
+    with st.form("weather_form", clear_on_submit=False):
+        st.markdown("#### Häädemeeste ilmajaam")
+        c1, c2, c3 = st.columns(3)
+        temp_avg = optional_number(c1, "Keskmine temperatuur, °C", existing_weather.get("temp_avg_c"), step=0.1)
+        temp_min = optional_number(c2, "Miinimumtemperatuur, °C", existing_weather.get("temp_min_c"), step=0.1)
+        temp_max = optional_number(c3, "Maksimumtemperatuur, °C", existing_weather.get("temp_max_c"), step=0.1)
+
+        c1, c2, c3 = st.columns(3)
+        humidity_avg = optional_number(c1, "Keskmine õhuniiskus, %", existing_weather.get("humidity_avg_pct"), min_value=0.0, max_value=100.0, step=0.1)
+        humidity_min = optional_number(c2, "Minimaalne õhuniiskus, %", existing_weather.get("humidity_min_pct"), min_value=0.0, max_value=100.0, step=0.1)
+        humidity_max = optional_number(c3, "Maksimaalne õhuniiskus, %", existing_weather.get("humidity_max_pct"), min_value=0.0, max_value=100.0, step=0.1)
+
+        c1, c2 = st.columns(2)
+        precipitation = optional_number(c1, "Sademed, mm", existing_weather.get("precipitation_mm"), min_value=0.0, step=0.1)
+        dewpoint = optional_number(c2, "Keskmine kastepunkt, °C", existing_weather.get("dewpoint_avg_c"), step=0.1)
+
+        st.markdown("#### Tuul")
+        c1, c2, c3, c4 = st.columns(4)
+        wind_avg = optional_number(c1, "Keskmine, m/s", existing_weather.get("wind_avg_ms"), min_value=0.0, step=0.1)
+        wind_max = optional_number(c2, "Maksimum, m/s", existing_weather.get("wind_max_ms"), min_value=0.0, step=0.1)
+        wind_gust = optional_number(c3, "Maks. puhang, m/s", existing_weather.get("wind_gust_ms"), min_value=0.0, step=0.1)
+        wind_direction = optional_number(c4, "Suund, °", existing_weather.get("wind_direction_deg"), min_value=0.0, max_value=360.0, step=1.0)
+
+        st.markdown("#### Muud näitajad")
+        c1, c2 = st.columns(2)
+        pressure = optional_number(c1, "Keskmine õhurõhk, hPa", existing_weather.get("pressure_avg_hpa"), min_value=0.0, step=0.1)
+        sunshine = optional_number(c2, "Päikesepaiste kestus, h", existing_weather.get("sunshine_hours"), min_value=0.0, step=0.1)
+
+        st.markdown("#### Pärnu ilmajaam")
+        radiation = optional_number(st, "Globaalradiatsioon, MJ/m²", existing_weather.get("radiation_mj_m2"), min_value=0.0, step=0.01)
+        notes = st.text_area("Märkused", value=str(existing_weather.get("notes") or ""))
+
+        weather_submitted = st.form_submit_button("Salvesta ilmaandmed", use_container_width=True)
+
+    if weather_submitted:
+        try:
+            save_weather(
+                weather_day,
+                {
+                    "source_station": "Häädemeeste",
+                    "temp_avg_c": temp_avg,
+                    "temp_min_c": temp_min,
+                    "temp_max_c": temp_max,
+                    "humidity_avg_pct": humidity_avg,
+                    "humidity_min_pct": humidity_min,
+                    "humidity_max_pct": humidity_max,
+                    "precipitation_mm": precipitation,
+                    "wind_avg_ms": wind_avg,
+                    "wind_max_ms": wind_max,
+                    "wind_gust_ms": wind_gust,
+                    "wind_direction_deg": wind_direction,
+                    "pressure_avg_hpa": pressure,
+                    "dewpoint_avg_c": dewpoint,
+                    "sunshine_hours": sunshine,
+                    "radiation_mj_m2": radiation,
+                    "radiation_station": "Pärnu",
+                    "notes": notes.strip() or None,
+                },
+            )
+            st.success("Ilmaandmed salvestatud.")
+            rerun()
+        except DatabaseError as exc:
+            show_database_error(exc)
+
 
 with tab_history:
     st.subheader("Korjeajalugu")
