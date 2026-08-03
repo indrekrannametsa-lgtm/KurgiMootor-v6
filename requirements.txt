@@ -1,0 +1,2 @@
+streamlit==1.49.1
+supabase==2.18.1
