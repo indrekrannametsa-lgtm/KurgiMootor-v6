@@ -121,35 +121,54 @@ with tabs[2]:
             st.success("Ilmaandmed uuendatud.")
             st.rerun()
 
-    start = date(TODAY_DATE.year, 7, 1)
-    end = TODAY_DATE + timedelta(days=8)
-    weather = db.weather_rows(start.isoformat(), end.isoformat())
-    by_date = {r["weather_date"]: dict(r) for r in weather}
-    display = []
-    d = start
-    while d <= end:
-        key = d.isoformat()
-        row = by_date.get(key)
-        if row is None:
-            state = "🔴 Puudub"
-            display.append({"Kuupäev": key, "Olek": state, "Temp °C": None, "Tuul m/s": None, "Radiatsioon MJ/m²": None, "Kontroll": "Andmeid pole"})
-        else:
-            if row["data_kind"] == "forecast":
-                state = "🔵 Prognoos" if row["checked"] else "🔴 Vigane prognoos"
-            else:
-                state = "🟢 Kontrollitud" if row["checked"] else "🔴 Puudulik"
-            display.append({
-                "Kuupäev": key,
-                "Olek": state,
-                "Temp °C": row["t_avg"],
-                "Tuul m/s": row["wind_avg"],
-                "Radiatsioon MJ/m²": row["radiation"],
-                "Kontroll": row["check_message"],
-            })
-        d += timedelta(days=1)
+    season_start = date(TODAY_DATE.year, 7, 1)
+    forecast_end = TODAY_DATE + timedelta(days=8)
+    weather = db.weather_rows(season_start.isoformat(), forecast_end.isoformat())
 
-    st.dataframe(pd.DataFrame(display), use_container_width=True, hide_index=True, height=560)
-    st.caption("Mõõdetud: temperatuur ja tuul Häädemeestelt, globaalradiatsioon Pärnust. Prognoos: farmi piirkonna 9 päeva mudelprognoos.")
+    measured_display = []
+    forecast_display = []
+    for raw in weather:
+        row = dict(raw)
+        item = {
+            "Kuupäev": row["weather_date"],
+            "Temp °C": row["t_avg"],
+            "Tuul m/s": row["wind_avg"],
+            "Radiatsioon MJ/m²": row["radiation"],
+            "Kontroll": row["check_message"],
+        }
+        if row["data_kind"] == "forecast":
+            item["Olek"] = "🔵 Prognoos" if row["checked"] else "🔴 Vigane prognoos"
+            forecast_display.append(item)
+        else:
+            item["Olek"] = "🟢 Kontrollitud" if row["checked"] else "🔴 Puudulik"
+            measured_display.append(item)
+
+    st.markdown("#### Viimased mõõdetud päevad")
+    if measured_display:
+        # Uusim päev üleval; näitame korraga viimaseid 14 päeva.
+        latest_measured = list(reversed(measured_display))[:14]
+        st.dataframe(
+            pd.DataFrame(latest_measured),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("Mõõdetud ilmaandmeid pole veel salvestatud.")
+
+    st.markdown("#### 9 päeva prognoos")
+    if forecast_display:
+        st.dataframe(
+            pd.DataFrame(forecast_display),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.warning("Prognoosi pole veel salvestatud. Vajuta „Uuenda ilm kohe“.")
+
+    st.caption(
+        "Mõõdetud: temperatuur ja tuul Häädemeestelt, globaalradiatsioon Pärnust. "
+        "Prognoos: farmi piirkonna 9 päeva mudelprognoos."
+    )
 
 with tabs[3]:
     st.subheader("Prognoos")
