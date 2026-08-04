@@ -393,7 +393,12 @@ class WeatherService:
                 headers=self.HEADERS,
                 timeout=30,
             )
-            if not response.ok: raise RuntimeError(f"Keskkonnaandmete API{response.status_code}:{response.text}")
+            status_code = getattr(response, "status_code", 200)
+            if status_code >= 400:
+                response_text = getattr(response, "text", "")
+                raise RuntimeError(
+                    f"Keskkonnaandmete API {status_code}: {response_text}"
+                )
             payload = response.json()
             if not isinstance(payload, list):
                 raise ValueError("Ametlik ilma-API ei tagastanud kirjete loendit.")
@@ -424,6 +429,10 @@ class WeatherService:
                 if "c" in unit or "°c" in str(row.get("element_yhik", "")):
                     score += 5
             elif kind == "wind":
+                # Official daily mean wind code is DWS08. Older/test datasets
+                # may expose DWS, so accept both.
+                if code in {"dws08", "dws"}:
+                    score += 100
                 if "wind speed" in name and ("daily avg" in name or "average" in name):
                     score += 70
                 if "tuule" in name and "kiirus" in name and "keskm" in name:
