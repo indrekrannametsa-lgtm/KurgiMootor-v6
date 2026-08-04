@@ -322,3 +322,23 @@ grant execute on function public.remove_daily_plan_field(date, integer) to servi
 grant execute on function public.get_harvest_history(integer) to service_role;
 
 commit;
+
+-- V6.1 weather integration (idempotent)
+create table if not exists public.app_settings (
+    key text primary key,
+    value text not null,
+    updated_at timestamptz not null default now()
+);
+
+alter table public.weather_daily add column if not exists data_kind text not null default 'measured';
+alter table public.weather_daily add column if not exists forecast_source text;
+alter table public.weather_daily add column if not exists checked boolean not null default false;
+alter table public.weather_daily add column if not exists check_message text;
+
+create index if not exists weather_daily_kind_date_idx
+    on public.weather_daily (data_kind, weather_date desc);
+
+alter table public.app_settings enable row level security;
+revoke all on public.app_settings from anon, authenticated;
+grant all on public.app_settings to service_role;
+grant all on public.weather_daily to service_role;
