@@ -131,7 +131,8 @@ with tabs[2]:
         row = dict(raw)
         item = {
             "Kuupäev": row["weather_date"],
-            "Temp °C": row["t_avg"],
+            "Min °C": row["t_min"],
+            "Max °C": row["t_max"],
             "Tuul m/s": row["wind_avg"],
             "Radiatsioon MJ/m²": row["radiation"],
             "Kontroll": row["check_message"],
