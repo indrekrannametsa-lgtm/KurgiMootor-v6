@@ -14,6 +14,8 @@ import db
 ESTONIA = ZoneInfo("Europe/Tallinn")
 OFFICIAL_HOURLY = "https://keskkonnaandmed.envir.ee/f_kliima_tund"
 OFFICIAL_DAILY = "https://keskkonnaandmed.envir.ee/f_kliima_paev"
+HYDRO_OBSERVATIONS = "https://keskkonnaandmed.envir.ee/f_hydroseire"
+HAADEMEESTE_STATION_CODE = "86031"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
 HEADERS = {"Accept-Profile": "apijahiala", "Accept": "application/json"}
 FARM_LAT = 58.13
@@ -36,7 +38,7 @@ class WeatherService:
             yield current.year, current.month
             current = date(current.year + (current.month == 12), 1 if current.month == 12 else current.month + 1, 1)
 
-    def _get_json(self, url: str, params: Dict[str, Any], headers: Dict[str, str] | None = None) -> Any:
+    def _get_json(self, url: str, params: Any, headers: Dict[str, str] | None = None) -> Any:
         response = self.http.get(url, params=params, headers=headers, timeout=45)
         if not response.ok:
             raise WeatherError(f"API {response.status_code}: {response.text}")
@@ -77,21 +79,97 @@ class WeatherService:
         except Exception:
             return None
 
+    @staticmethod
+    def _normalise_name(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        return (text.replace("õ", "o").replace("ä", "a").replace("ö", "o")
+                    .replace("ü", "u").replace("š", "s").replace("ž", "z"))
+
+    @classmethod
+    def _series_score(cls, name: str, kind: str) -> int:
+        n = cls._normalise_name(name)
+        if kind == "temperature":
+            if not any(token in n for token in ("ohutemp", "air temp", "temperature air", " ta")):
+                return -1
+            if any(token in n for token in ("vesi", "water", "pinnas", "soil")):
+                return -1
+            score = 10
+            if "ohutemperatuur" in n:
+                score += 10
+            if "10 min" in n or "10 minuti" in n:
+                score += 2
+            return score
+
+        if not any(token in n for token in ("tuule kiirus", "wind speed", "windspeed")):
+            return -1
+        if any(token in n for token in ("suund", "direction", "puhang", "gust", "maks", "max")):
+            return -1
+        score = 10
+        if "10 minuti keskmine" in n or "10 min avg" in n or "10 minute average" in n:
+            score += 10
+        elif "2 minuti keskmine" in n or "2 min avg" in n or "2 minute average" in n:
+            score += 6
+        elif "keskmine" in n or "avg" in n or "average" in n:
+            score += 4
+        return score
+
+    def _hydro_rows(self, start_day: date, end_day: date) -> List[Dict[str, Any]]:
+        # Kohalik päev teisendatakse UTC piirideks, sest teenuse ajatempel on UTC-s.
+        start_local = datetime.combine(start_day, datetime.min.time(), tzinfo=ESTONIA)
+        end_local = datetime.combine(end_day + timedelta(days=1), datetime.min.time(), tzinfo=ESTONIA)
+        start_utc = start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        end_utc = end_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        params = [
+            ("jaam_kood", f"eq.{HAADEMEESTE_STATION_CODE}"),
+            ("timeline_ts_utc", f"gte.{start_utc}"),
+            ("timeline_ts_utc", f"lt.{end_utc}"),
+            ("select", "timeline_ts_utc,jaam_kood,jaam_nimi,aegrida_nimi,vaartus"),
+            ("order", "timeline_ts_utc.asc"),
+            ("limit", "20000"),
+        ]
+        payload = self._get_json(HYDRO_OBSERVATIONS, params, HEADERS)
+        if not isinstance(payload, list):
+            raise WeatherError("Hüdroseire API ei tagastanud loendit.")
+        return payload
+
+    @classmethod
+    def _choose_series(cls, rows: List[Dict[str, Any]], kind: str) -> str | None:
+        names = sorted({str(row.get("aegrida_nimi") or "").strip() for row in rows if row.get("aegrida_nimi")})
+        ranked = sorted(((cls._series_score(name, kind), name) for name in names), reverse=True)
+        return ranked[0][1] if ranked and ranked[0][0] >= 0 else None
+
+    @staticmethod
+    def _hydro_local_day(row: Dict[str, Any]) -> date | None:
+        try:
+            ts = str(row.get("timeline_ts_utc") or "").replace("Z", "+00:00")
+            return datetime.fromisoformat(ts).astimezone(ESTONIA).date()
+        except Exception:
+            return None
+
     def _haademeeste_daily(self, start_day: date, end_day: date) -> Dict[str, Dict[str, float]]:
-        temp_rows = self._official_rows(OFFICIAL_HOURLY, "Häädemeeste", "TA", start_day - timedelta(days=1), end_day)
-        wind_rows = self._official_rows(OFFICIAL_HOURLY, "Häädemeeste", "WS10M", start_day - timedelta(days=1), end_day)
+        rows = self._hydro_rows(start_day, end_day)
+        temp_series = self._choose_series(rows, "temperature")
+        wind_series = self._choose_series(rows, "wind")
+        if not temp_series or not wind_series:
+            available = sorted({str(r.get("aegrida_nimi") or "") for r in rows if r.get("aegrida_nimi")})
+            raise WeatherError(
+                "Häädemeeste jaama temperatuuri või tuule aegrida ei leitud. "
+                f"Saadaval: {', '.join(available[:30])}"
+            )
+
         temps: Dict[date, List[float]] = defaultdict(list)
         winds: Dict[date, List[float]] = defaultdict(list)
-        for row in temp_rows:
-            d = self._hourly_local_day(row)
+        for row in rows:
+            d = self._hydro_local_day(row)
             value = self._as_float(row.get("vaartus"))
-            if d and value is not None and start_day <= d <= end_day:
+            if not d or value is None or not start_day <= d <= end_day:
+                continue
+            series = str(row.get("aegrida_nimi") or "").strip()
+            if series == temp_series:
                 temps[d].append(value)
-        for row in wind_rows:
-            d = self._hourly_local_day(row)
-            value = self._as_float(row.get("vaartus"))
-            if d and value is not None and start_day <= d <= end_day:
+            elif series == wind_series:
                 winds[d].append(value)
+
         result: Dict[str, Dict[str, float]] = {}
         d = start_day
         while d <= end_day:
@@ -233,8 +311,11 @@ class WeatherService:
     def test_sources(self, today: date) -> Dict[str, Any]:
         """Kontrollib nelja vajalikku allikat ilma Supabase'i kirjutamata."""
         measured_day = today - timedelta(days=1)
-        temp_rows = self._official_rows(OFFICIAL_HOURLY, "Häädemeeste", "TA", measured_day, measured_day)
-        wind_rows = self._official_rows(OFFICIAL_HOURLY, "Häädemeeste", "WS10M", measured_day, measured_day)
+        hydro_rows = self._hydro_rows(measured_day, measured_day)
+        temp_series = self._choose_series(hydro_rows, "temperature")
+        wind_series = self._choose_series(hydro_rows, "wind")
+        temp_rows = [r for r in hydro_rows if str(r.get("aegrida_nimi") or "").strip() == temp_series]
+        wind_rows = [r for r in hydro_rows if str(r.get("aegrida_nimi") or "").strip() == wind_series]
         radiation_rows = []
         for year, month in self._month_ranges(measured_day, measured_day):
             radiation_rows.extend(self._get_json(OFFICIAL_DAILY, {
@@ -247,24 +328,35 @@ class WeatherService:
                 "order": "paev.asc",
             }, HEADERS))
 
-        forecast = self._get_json(OPEN_METEO, {
-            "latitude": FARM_LAT,
-            "longitude": FARM_LON,
-            "timezone": "Europe/Tallinn",
-            "start_date": today.isoformat(),
-            "end_date": today.isoformat(),
-            "daily": "temperature_2m_min,temperature_2m_max,shortwave_radiation_sum",
-            "hourly": "wind_speed_10m",
-            "wind_speed_unit": "ms",
-        })
-        forecast_dates = list((forecast.get("daily") or {}).get("time") or [])
+        forecast_dates = []
+        forecast_error = None
+        try:
+            forecast = self._get_json(OPEN_METEO, {
+                "latitude": FARM_LAT,
+                "longitude": FARM_LON,
+                "timezone": "Europe/Tallinn",
+                "start_date": today.isoformat(),
+                "end_date": today.isoformat(),
+                "daily": "temperature_2m_min,temperature_2m_max,shortwave_radiation_sum",
+                "hourly": "wind_speed_10m",
+                "wind_speed_unit": "ms",
+            })
+            forecast_dates = list((forecast.get("daily") or {}).get("time") or [])
+        except Exception as exc:
+            forecast_error = str(exc)
 
         return {
             "measured_day": measured_day.isoformat(),
+            "haademeeste_station_code": HAADEMEESTE_STATION_CODE,
+            "haademeeste_temperature_series": temp_series,
             "haademeeste_temperature_rows": len(temp_rows),
+            "haademeeste_wind_series": wind_series,
             "haademeeste_wind_rows": len(wind_rows),
+            "haademeeste_available_series": sorted({str(r.get("aegrida_nimi") or "") for r in hydro_rows if r.get("aegrida_nimi")}),
             "parnu_radiation_rows": len(radiation_rows),
             "forecast_days": len(forecast_dates),
+            "forecast_error": forecast_error,
+            "measured_sources_ok": bool(temp_rows and wind_rows and radiation_rows),
             "ok": bool(temp_rows and wind_rows and radiation_rows and forecast_dates),
         }
 
