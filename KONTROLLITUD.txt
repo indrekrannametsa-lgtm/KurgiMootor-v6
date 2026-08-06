@@ -1,0 +1,20 @@
+KurgiMootor V6.1 — PÄRNU ILM, kontrollitud täisprojekt
+
+Rakenduse põhifail: V6/kurgimootor_v6/app.py
+Ilmakood: V6/kurgimootor_v6/core.py
+
+Mõõdetud andmed:
+- temperatuur: Pärnu / TA
+- tuul: Pärnu / WS10M
+- globaalradiatsioon: Pärnu / DRQS
+
+Kontrollid:
+- kogu projekti Python-failid kompileeruvad
+- Pärnu min/max temperatuuri arvutus testitud
+- Pärnu keskmise tuule arvutus testitud
+- Pärnu radiatsiooni lugemine testitud
+- ilmaallikate testfunktsioon testitud
+- Häädemeeste ja hydroseire koodi projektis ei ole
+- rakenduse ilmatekst on uuendatud Pärnu jaamale
+
+Märkus: väliste API-de reaalajas vastust ei saanud ehituskeskkonna DNS-piirangu tõttu siin otse kontrollida. Rakenduse testnupp teeb selle kontrolli Streamlitis.

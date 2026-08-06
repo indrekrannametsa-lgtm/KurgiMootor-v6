@@ -1,5 +1,4 @@
-from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -7,7 +6,7 @@ import streamlit as st
 import db
 from core import WeatherService
 
-TODAY = datetime.now(ZoneInfo("Europe/Tallinn")).date()
+TODAY = date.today()
 st.set_page_config(page_title="KurgiMootor V6.1", page_icon="🥒", layout="wide")
 
 try:
@@ -83,7 +82,7 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Ilmaklots")
-    st.caption("Mõõdetud temperatuur ja tuul Häädemeestelt, globaalradiatsioon Pärnust.")
+    st.caption("Mõõdetud temperatuur, tuul ja globaalradiatsioon Pärnu jaamast.")
     counts = db.get_weather_counts()
     a, b, c = st.columns(3)
     a.metric("Mõõdetud päevi", counts["measured"])
@@ -93,20 +92,7 @@ with tabs[2]:
     error = db.get_app_setting("weather_last_error", "")
     if error:
         st.error(error)
-    test_col, refresh_col = st.columns(2)
-    if test_col.button("Testi ilmaallikaid"):
-        with st.spinner("Kontrollin Häädemeeste, Pärnu ja prognoosi allikaid..."):
-            try:
-                test = WeatherService().test_sources(TODAY)
-                if test["ok"]:
-                    st.success("Kõik neli vajalikku ilmaallikat vastasid.")
-                else:
-                    st.warning("Vähemalt üks ilmaallikas ei tagastanud andmeid.")
-                st.json(test)
-            except Exception as exc:
-                st.error(f"Ilmaallikate test ebaõnnestus: {exc}")
-
-    if refresh_col.button("Uuenda ilm kohe"):
+    if st.button("Uuenda ilm kohe"):
         with st.spinner("Laen mõõteandmeid ja 9 päeva prognoosi..."):
             result = WeatherService().safe_refresh_all(TODAY)
         if result.get("error"):
