@@ -310,7 +310,7 @@ class WeatherService:
 
     def test_sources(self, today: date) -> Dict[str, Any]:
         """Kontrollib nelja vajalikku allikat ilma Supabase'i kirjutamata."""
-        measured_day = today - timedelta(days=1)
+        measured_day = today - timedelta(days=2)
         hydro_rows = self._hydro_rows(measured_day, measured_day)
         temp_series = self._choose_series(hydro_rows, "temperature")
         wind_series = self._choose_series(hydro_rows, "wind")
