@@ -78,8 +78,8 @@ class WeatherService:
             return None
 
     def _haademeeste_daily(self, start_day: date, end_day: date) -> Dict[str, Dict[str, float]]:
-        temp_rows = self._official_rows(OFFICIAL_HOURLY, "Häädemeeste", "TA", start_day - timedelta(days=1), end_day)
-        wind_rows = self._official_rows(OFFICIAL_HOURLY, "Häädemeeste", "WS10M", start_day - timedelta(days=1), end_day)
+        temp_rows = self._official_rows(OFFICIAL_HOURLY, "haademeeste", "TA", start_day - timedelta(days=1), end_day)
+        wind_rows = self._official_rows(OFFICIAL_HOURLY, "haademeeste", "WS10M", start_day - timedelta(days=1), end_day)
         temps: Dict[date, List[float]] = defaultdict(list)
         winds: Dict[date, List[float]] = defaultdict(list)
         for row in temp_rows:
