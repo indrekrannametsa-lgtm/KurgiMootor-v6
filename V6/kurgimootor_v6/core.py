@@ -233,8 +233,8 @@ class WeatherService:
     def test_sources(self, today: date) -> Dict[str, Any]:
         """Kontrollib nelja vajalikku allikat ilma Supabase'i kirjutamata."""
         measured_day = today - timedelta(days=1)
-        temp_rows = self._official_rows(OFFICIAL_HOURLY, "Häädemeeste", "TA", measured_day, measured_day)
-        wind_rows = self._official_rows(OFFICIAL_HOURLY, "Häädemeeste", "WS10M", measured_day, measured_day)
+        temp_rows = self._official_rows(OFFICIAL_HOURLY, "haademeeste", "TA", measured_day, measured_day)
+        wind_rows = self._official_rows(OFFICIAL_HOURLY, "haademeeste", "WS10M", measured_day, measured_day)
         radiation_rows = []
         for year, month in self._month_ranges(measured_day, measured_day):
             radiation_rows.extend(self._get_json(OFFICIAL_DAILY, {
