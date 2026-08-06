@@ -235,7 +235,17 @@ class WeatherService:
         measured_day = today - timedelta(days=1)
         temp_rows = self._official_rows(OFFICIAL_HOURLY, "Häädemeeste", "TA", measured_day, measured_day)
         wind_rows = self._official_rows(OFFICIAL_HOURLY, "Häädemeeste", "WS10M", measured_day, measured_day)
-        radiation_rows = self._official_rows(OFFICIAL_DAILY, "Pärnu", "DRQS", measured_day, measured_day)
+        radiation_rows = []
+        for year, month in self._month_ranges(measured_day, measured_day):
+            radiation_rows.extend(self._get_json(OFFICIAL_DAILY, {
+                "jaam_nimi": "like.Pärnu",
+                "element_kood": "eq.DRQS",
+                "aasta": f"eq.{year}",
+                "kuu": f"eq.{month}",
+                "paev": f"eq.{measured_day.day}",
+                "select": "aasta,kuu,paev,vaartus,element_kood",
+                "order": "paev.asc",
+            }, HEADERS))
 
         forecast = self._get_json(OPEN_METEO, {
             "latitude": FARM_LAT,
