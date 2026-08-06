@@ -230,6 +230,34 @@ class WeatherService:
             saved += 1
         return {"saved": saved}
 
+    def test_sources(self, today: date) -> Dict[str, Any]:
+        """Kontrollib nelja vajalikku allikat ilma Supabase'i kirjutamata."""
+        measured_day = today - timedelta(days=1)
+        temp_rows = self._official_rows(OFFICIAL_HOURLY, "Häädemeeste", "TA", measured_day, measured_day)
+        wind_rows = self._official_rows(OFFICIAL_HOURLY, "Häädemeeste", "WS10M", measured_day, measured_day)
+        radiation_rows = self._official_rows(OFFICIAL_DAILY, "Pärnu", "DRQS", measured_day, measured_day)
+
+        forecast = self._get_json(OPEN_METEO, {
+            "latitude": FARM_LAT,
+            "longitude": FARM_LON,
+            "timezone": "Europe/Tallinn",
+            "start_date": today.isoformat(),
+            "end_date": today.isoformat(),
+            "daily": "temperature_2m_min,temperature_2m_max,shortwave_radiation_sum",
+            "hourly": "wind_speed_10m",
+            "wind_speed_unit": "ms",
+        })
+        forecast_dates = list((forecast.get("daily") or {}).get("time") or [])
+
+        return {
+            "measured_day": measured_day.isoformat(),
+            "haademeeste_temperature_rows": len(temp_rows),
+            "haademeeste_wind_rows": len(wind_rows),
+            "parnu_radiation_rows": len(radiation_rows),
+            "forecast_days": len(forecast_dates),
+            "ok": bool(temp_rows and wind_rows and radiation_rows and forecast_dates),
+        }
+
     def refresh_all(self, today: date) -> Dict[str, Any]:
         measured_start = date(today.year, 7, 1)
         measured_end = today - timedelta(days=1)
