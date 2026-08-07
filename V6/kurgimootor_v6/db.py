@@ -100,6 +100,50 @@ def get_weather_counts() -> Dict[str, int]:
     }
 
 
+
+def get_latest_checked_measured_date() -> date | None:
+    response = _execute(
+        _client().table("weather_daily")
+        .select("weather_date")
+        .eq("data_kind", "measured")
+        .eq("checked", True)
+        .order("weather_date", desc=True)
+        .limit(1)
+    )
+    rows = list(response.data or [])
+    if not rows:
+        return None
+    try:
+        return date.fromisoformat(str(rows[0]["weather_date"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def get_incomplete_measured_dates(start_day: date, end_day: date) -> List[date]:
+    rows = get_weather_rows(start_day, end_day)
+    by_day = {str(r.get("weather_date")): r for r in rows if r.get("data_kind") == "measured"}
+    missing: List[date] = []
+    current = start_day
+    while current <= end_day:
+        row = by_day.get(current.isoformat())
+        required_values = (
+            "temp_min_c",
+            "temp_max_c",
+            "wind_avg_ms",
+            "radiation_mj_m2",
+            "humidity_avg_pct",
+            "precipitation_mm",
+            "et0_mm",
+        )
+        if (
+            not row
+            or not bool(row.get("checked"))
+            or any(row.get(field) is None for field in required_values)
+        ):
+            missing.append(current)
+        current += date.resolution
+    return missing
+
 def set_app_setting(key: str, value: str) -> None:
     _execute(_client().table("app_settings").upsert({"key": key, "value": str(value)}, on_conflict="key"))
 

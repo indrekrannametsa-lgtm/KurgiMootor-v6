@@ -15,6 +15,12 @@ except Exception as exc:
     st.error(f"Andmebaasi viga: {exc}")
     st.stop()
 
+# Ilm kontrollitakse automaatselt üks kord päevas. Viga ei takista korjete kasutamist.
+try:
+    WeatherService().auto_refresh_if_needed(TODAY)
+except Exception as exc:
+    db.set_app_setting("weather_last_error", f"Automaatne ilmauuendus: {exc}")
+
 st.title("KurgiMootor V6.1")
 st.caption("Saagi ennustamise tööriist. Avaleht on töövoog, mitte ilmarakendus.")
 
@@ -82,13 +88,16 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Ilmaklots")
-    st.caption("Mõõdetud temperatuur, tuul ja globaalradiatsioon Pärnu jaamast.")
+    st.caption("Mõõdetud temperatuur, tuul, globaalradiatsioon, õhuniiskus ja sademed Pärnu jaamast. ET0 arvutatakse automaatselt.")
     counts = db.get_weather_counts()
     a, b, c = st.columns(3)
     a.metric("Mõõdetud päevi", counts["measured"])
     b.metric("Rohelisi päevi", counts["checked"])
     c.metric("Prognoosipäevi", counts["forecast"])
-    st.caption(f"Viimane uuendus: {db.get_app_setting('weather_last_refresh_at', '—')}")
+    st.caption(f"Viimane automaatne uuendus: {db.get_app_setting('weather_last_refresh_at', '—')}")
+    last_result = db.get_app_setting("weather_last_result", "")
+    if last_result:
+        st.caption(last_result)
     error = db.get_app_setting("weather_last_error", "")
     if error:
         st.error(error)
@@ -96,10 +105,10 @@ with tabs[2]:
         with st.spinner("Laen mõõteandmeid ja 9 päeva prognoosi..."):
             result = WeatherService().safe_refresh_all(TODAY)
         if result.get("error"):
-            st.error(result["error"])
+            st.warning(f"Uuendus tehti osaliselt: {result['error']}")
         else:
             st.success("Ilmaandmed uuendatud.")
-            st.rerun()
+        st.rerun()
 
     rows = db.get_weather_rows(TODAY - timedelta(days=30), TODAY + timedelta(days=8))
     measured_rows = [r for r in rows if r.get("data_kind") == "measured"][-14:][::-1]
@@ -111,6 +120,9 @@ with tabs[2]:
         "Min °C": r.get("temp_min_c"),
         "Max °C": r.get("temp_max_c"),
         "Tuul m/s": r.get("wind_avg_ms"),
+        "Niiskus %": r.get("humidity_avg_pct"),
+        "Sademed mm": r.get("precipitation_mm"),
+        "ET0 mm": r.get("et0_mm"),
         "Radiatsioon MJ/m²": r.get("radiation_mj_m2"),
         "Kontroll": r.get("check_message"),
         "Olek": "🟢 Kontrollitud" if r.get("checked") else "🔴 Puudulik",
@@ -123,6 +135,9 @@ with tabs[2]:
         "Min °C": r.get("temp_min_c"),
         "Max °C": r.get("temp_max_c"),
         "Tuul m/s": r.get("wind_avg_ms"),
+        "Niiskus %": r.get("humidity_avg_pct"),
+        "Sademed mm": r.get("precipitation_mm"),
+        "ET0 mm": r.get("et0_mm"),
         "Radiatsioon MJ/m²": r.get("radiation_mj_m2"),
         "Kontroll": r.get("check_message"),
         "Olek": "🔵 Prognoos" if r.get("checked") else "🔴 Vigane prognoos",
