@@ -1,5 +1,6 @@
 from datetime import date, timedelta
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -736,6 +737,161 @@ with tabs[3]:
             file_name="kurgimootor_training_dataset.csv",
             mime="text/csv",
         )
+
+        st.markdown("##### Kogusaagi testmudel")
+        st.caption(
+            "Esimene kontrollitav mudel. Hindamine on ajaliselt aus: iga testpäeva prognoos tehakse ainult "
+            "sellele päevale eelnenud korjetest õpitud mudeliga. Sama või hilisema päeva tegelikke saake "
+            "testprognoosi treenimisel ei kasutata."
+        )
+
+        # Väikese andmestiku jaoks kasutame regulaaritud lineaarset mudelit (ridge).
+        # Põld läheb sisse eraldi one-hot tunnusena; ilm ja intervall on pidevad tunnused.
+        # A/B/C/XL EI ole mudeli sisendid — need on ainult tegeliku korje tulemused.
+        continuous_cols = [
+            "Intervall p", "T kesk", "Radiatsioon Σ", "Radiatsioon/p",
+            "Sademed Σ", "Niiskus kesk", "ET0 Σ", "Tuul kesk", "Eelmine saak",
+        ]
+
+        model_df = training_df.copy().sort_values(["Kuupäev", "Põld"]).reset_index(drop=True)
+        fields = model_df["Põld"].astype(int).to_numpy()
+        y = model_df["Saak"].astype(float).to_numpy()
+        dates = pd.to_datetime(model_df["Kuupäev"]).dt.date.to_numpy()
+        raw_previous = pd.to_numeric(model_df["Eelmine saak"], errors="coerce").to_numpy(dtype=float)
+
+        # Kõik muud pidevad tunnused peavad õppimisreas olema numbrilised.
+        base_cont_cols = [c for c in continuous_cols if c != "Eelmine saak"]
+        X_base = model_df[base_cont_cols].astype(float).to_numpy()
+
+        def _design_matrix(x_cont, field_values, means, scales, prev_missing_values):
+            z = (x_cont - means) / scales
+            field_onehot = np.zeros((len(field_values), 14), dtype=float)
+            for row_i, f in enumerate(field_values):
+                if 1 <= int(f) <= 14:
+                    field_onehot[row_i, int(f) - 1] = 1.0
+            return np.column_stack([
+                np.ones(len(field_values)),
+                z,
+                prev_missing_values,
+                field_onehot,
+            ])
+
+        def _fit_predict_walk_forward(train_idx, test_idx, alpha=10.0):
+            # Eelmise saagi puuduva väärtuse täide arvutatakse AINULT treeningandmetest.
+            # Nii ei leki testrea info treeningusse.
+            train_prev = raw_previous[train_idx]
+            finite_train_prev = train_prev[np.isfinite(train_prev)]
+            prev_fill = float(np.median(finite_train_prev)) if len(finite_train_prev) else 0.0
+
+            train_prev_missing = (~np.isfinite(train_prev)).astype(float)
+            test_prev = raw_previous[test_idx]
+            test_prev_missing = (~np.isfinite(test_prev)).astype(float)
+
+            train_prev_filled = np.where(np.isfinite(train_prev), train_prev, prev_fill)
+            test_prev_filled = np.where(np.isfinite(test_prev), test_prev, prev_fill)
+
+            x_train = np.column_stack([X_base[train_idx], train_prev_filled])
+            x_test = np.column_stack([X_base[test_idx], test_prev_filled])
+
+            means = x_train.mean(axis=0)
+            scales = x_train.std(axis=0)
+            scales[scales < 1e-9] = 1.0
+
+            Xtr = _design_matrix(
+                x_train, fields[train_idx], means, scales, train_prev_missing
+            )
+            Xte = _design_matrix(
+                x_test, fields[test_idx], means, scales, test_prev_missing
+            )
+
+            # Intercepti ei karistata; ülejäänud kordajad saavad ridge-regularisatsiooni.
+            penalty = np.eye(Xtr.shape[1]) * alpha
+            penalty[0, 0] = 0.0
+            beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ y[train_idx]
+            pred = Xte @ beta
+            # Kastide arv ei saa olla negatiivne.
+            return np.maximum(pred, 0.0)
+
+        # Aus walk-forward test: ühe kuupäeva kõik põllud hoitakse korraga testis
+        # ning treeningusse lähevad ainult VARASEMAD kuupäevad.
+        predictions = np.full(len(model_df), np.nan, dtype=float)
+        min_train_rows = 10
+        for test_day in sorted(set(dates)):
+            test_idx = np.where(dates == test_day)[0]
+            train_idx = np.where(dates < test_day)[0]
+            if len(train_idx) < min_train_rows:
+                continue
+            predictions[test_idx] = _fit_predict_walk_forward(train_idx, test_idx)
+
+        valid_pred = np.isfinite(predictions)
+        if valid_pred.any():
+            errors = predictions - y
+            mae = float(np.mean(np.abs(errors[valid_pred])))
+            bias = float(np.mean(errors[valid_pred]))
+            rmse = float(np.sqrt(np.mean(errors[valid_pred] ** 2)))
+            within_2 = float(np.mean(np.abs(errors[valid_pred]) <= 2.0) * 100.0)
+
+            # Aus baasvõrdlus täpselt samadel testiridadel: järgmine saak = eelmine sama põllu saak.
+            baseline_mask = valid_pred & np.isfinite(raw_previous)
+            baseline_mae = None
+            model_mae_same_rows = None
+            if baseline_mask.any():
+                baseline_mae = float(np.mean(np.abs(raw_previous[baseline_mask] - y[baseline_mask])))
+                model_mae_same_rows = float(np.mean(np.abs(predictions[baseline_mask] - y[baseline_mask])))
+
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Walk-forward MAE", f"{mae:.1f} kasti")
+            r2.metric("RMSE", f"{rmse:.1f} kasti")
+            r3.metric("Keskmine nihe", f"{bias:+.1f} kasti")
+            r4.metric("±2 kasti sees", f"{within_2:.0f}%")
+
+            st.caption(
+                f"Ausalt testitud ridu: {int(valid_pred.sum())}/{len(model_df)}. "
+                f"Varasemad read jäid testist välja, kuni enne testpäeva oli vähemalt {min_train_rows} õppimisrida."
+            )
+
+            if baseline_mae is not None and model_mae_same_rows is not None:
+                delta = baseline_mae - model_mae_same_rows
+                if delta > 0:
+                    st.success(
+                        f"Samadel testiridadel: mudeli MAE {model_mae_same_rows:.1f} kasti vs "
+                        f"lihtne 'eelmine saak' {baseline_mae:.1f} kasti. "
+                        f"Mudeli eelis praeguses valimis: {delta:.1f} kasti."
+                    )
+                else:
+                    st.warning(
+                        f"Samadel testiridadel: mudeli MAE {model_mae_same_rows:.1f} kasti vs "
+                        f"lihtne 'eelmine saak' {baseline_mae:.1f} kasti. "
+                        "Praeguse väikese valimiga ei ole mudel veel baasreeglist parem."
+                    )
+
+            eval_df = model_df[["Kuupäev", "Põld", "Saak", "Eelmine saak"]].copy()
+            eval_df["Prognoos"] = predictions
+            eval_df["Viga"] = eval_df["Prognoos"] - eval_df["Saak"]
+            eval_df["|Viga|"] = eval_df["Viga"].abs()
+            eval_df = eval_df.sort_values(["Kuupäev", "Põld"], ascending=[False, True])
+            eval_df["Kuupäev"] = eval_df["Kuupäev"].map(lambda d: d.strftime("%d.%m"))
+
+            st.dataframe(
+                eval_df.style.format({
+                    "Saak": "{:.1f}",
+                    "Eelmine saak": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                    "Prognoos": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                    "Viga": lambda v: "—" if pd.isna(v) else f"{v:+.1f}",
+                    "|Viga|": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "Viga = prognoos − tegelik. Positiivne tähendab, et mootor ennustas liiga palju. "
+                "Need on ajaliselt ettepoole testitud prognoosid; sama või hilisema kuupäeva saake treeningus ei kasutata."
+            )
+        else:
+            st.info(
+                "Ausaks ajaliseks testiks ei ole veel piisavalt varasemaid õppimisridu. "
+                f"Esimene testpäev tekib, kui enne seda on vähemalt {min_train_rows} täielikku õppimisrida."
+            )
     else:
         st.info("Täieliku ilmavahemiku ja numbrilise saagiga õppimisridu ei ole veel piisavalt.")
 
