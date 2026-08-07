@@ -360,7 +360,7 @@ class WeatherService:
 
     def test_sources(self, today: date) -> Dict[str, Any]:
         """Kontrollib Pärnu mõõteallikaid ja Open-Meteo prognoosi ilma Supabase'i kirjutamata."""
-        measured_day = today - timedelta(days=2)
+        measured_day = today - timedelta(days=1)
         temp_rows = self._official_rows(OFFICIAL_HOURLY, "Pärnu", "TA", measured_day - timedelta(days=1), measured_day)
         wind_rows = self._official_rows(OFFICIAL_HOURLY, "Pärnu", "WS10M", measured_day - timedelta(days=1), measured_day)
         temp_rows_for_day = [r for r in temp_rows if self._hourly_local_day(r) == measured_day]
@@ -425,7 +425,7 @@ class WeatherService:
     def _refresh_measured_incremental(self, today: date) -> Dict[str, Any]:
         season_start = date(today.year, 7, 1)
         # Ametlikud päevad võivad saabuda viitega. Automaatika loeb kindlalt kuni üle-eilseni.
-        target_end = today - timedelta(days=2)
+        target_end = today - timedelta(days=1)
         if target_end < season_start:
             return {"saved": 0, "checked": 0, "ranges": []}
 
