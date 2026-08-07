@@ -434,6 +434,27 @@ with tabs[2]:
             st.success("Ilmaandmed uuendatud.")
         st.rerun()
 
+    if st.button("Kontrolli Pärnu allikaid"):
+        with st.spinner("Kontrollin Pärnu viimase lõppenud päeva tunni- ja päevaandmeid..."):
+            try:
+                source_test = WeatherService().test_sources(TODAY)
+                st.caption(
+                    f"Kontrollpäev {source_test.get('measured_day', '—')} · "
+                    f"TA {source_test.get('parnu_temperature_rows', 0)} · "
+                    f"WS10M {source_test.get('parnu_wind_rows', 0)} · "
+                    f"RH {source_test.get('parnu_rh_hourly_rows', 0)} · "
+                    f"PR1H {source_test.get('parnu_pr1h_hourly_rows', 0)} · "
+                    f"SDUR1H {source_test.get('parnu_sdur1h_hourly_rows', 0)} rida"
+                )
+                st.caption(
+                    f"Päevaelemendid: DRQS {source_test.get('parnu_radiation_rows', 0)} · "
+                    f"DRH08 {source_test.get('parnu_humidity_rows', 0)} · "
+                    f"DPREC {source_test.get('parnu_precipitation_rows', 0)} · "
+                    f"ET0 {source_test.get('et0_mm', None)}"
+                )
+            except Exception as exc:
+                st.error(f"Pärnu allikate kontroll ebaõnnestus: {exc}")
+
     history_default_start = date(TODAY.year, 7, 1)
     history_default_end = TODAY
     st.subheader("Mõõdetud ilma ajalugu")

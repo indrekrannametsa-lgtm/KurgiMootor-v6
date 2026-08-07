@@ -17,7 +17,7 @@ ESTONIA = ZoneInfo("Europe/Tallinn")
 OFFICIAL_HOURLY = "https://keskkonnaandmed.envir.ee/f_kliima_tund"
 OFFICIAL_DAILY = "https://keskkonnaandmed.envir.ee/f_kliima_paev"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
-HEADERS = {"Accept-Profile": "apijahiala", "Accept": "application/json"}
+HEADERS = {"Accept-Profile": "apijahialad", "Accept": "application/json"}
 FARM_LAT = 58.13
 FARM_LON = 24.50
 FARM_ELEVATION_M = 5.0
@@ -475,8 +475,15 @@ class WeatherService:
         measured_day = today - timedelta(days=1)
         temp_rows = self._official_rows(OFFICIAL_HOURLY, "Pärnu", "TA", measured_day - timedelta(days=1), measured_day)
         wind_rows = self._official_rows(OFFICIAL_HOURLY, "Pärnu", "WS10M", measured_day - timedelta(days=1), measured_day)
+        rh_rows = self._official_rows(OFFICIAL_HOURLY, "Pärnu", "RH", measured_day - timedelta(days=1), measured_day)
+        pr1h_rows = self._official_rows(OFFICIAL_HOURLY, "Pärnu", "PR1H", measured_day - timedelta(days=1), measured_day)
+        sdur_rows = self._official_rows(OFFICIAL_HOURLY, "Pärnu", "SDUR1H", measured_day - timedelta(days=1), measured_day)
+
         temp_rows_for_day = [r for r in temp_rows if self._hourly_local_day(r) == measured_day]
         wind_rows_for_day = [r for r in wind_rows if self._hourly_local_day(r) == measured_day]
+        rh_rows_for_day = [r for r in rh_rows if self._hourly_local_day(r) == measured_day]
+        pr1h_rows_for_day = [r for r in pr1h_rows if self._hourly_local_day(r) == measured_day]
+        sdur_rows_for_day = [r for r in sdur_rows if self._hourly_local_day(r) == measured_day]
 
         radiation = self._parnu_daily_element("DRQS", measured_day, measured_day)
         humidity = self._parnu_daily_element("DRH08", measured_day, measured_day)
@@ -524,6 +531,9 @@ class WeatherService:
             "measured_day": key,
             "parnu_temperature_rows": len(temp_rows_for_day),
             "parnu_wind_rows": len(wind_rows_for_day),
+            "parnu_rh_hourly_rows": len(rh_rows_for_day),
+            "parnu_pr1h_hourly_rows": len(pr1h_rows_for_day),
+            "parnu_sdur1h_hourly_rows": len(sdur_rows_for_day),
             "parnu_radiation_rows": int(key in radiation),
             "parnu_humidity_rows": int(key in humidity),
             "parnu_precipitation_rows": int(key in precipitation),
