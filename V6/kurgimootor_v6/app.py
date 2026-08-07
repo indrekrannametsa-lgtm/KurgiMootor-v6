@@ -543,6 +543,7 @@ with tabs[3]:
                 "missing_days": missing_days,
                 "current_row": row,
                 "previous_row": previous_row,
+                "previous2_row": items[idx - 2][1] if idx >= 2 else None,
             }
             if missing_days:
                 incomplete_samples.append(sample)
@@ -643,6 +644,7 @@ with tabs[3]:
     for sample in usable_samples:
         current_row = sample.get("current_row") or {}
         previous_row = sample.get("previous_row") or {}
+        previous2_row = sample.get("previous2_row") or {}
 
         # Õpperea siht peab olema päriselt numbriline. Osaline vana kirje võib olla
         # kasvuperioodi alguspunkt, kuid seda ei kasutata ise sihtreana.
@@ -675,12 +677,23 @@ with tabs[3]:
         except (TypeError, ValueError):
             previous_total = None
 
+        def _maybe_float(value):
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        previous_xl = _maybe_float(previous_row.get("xl"))
+        previous2_xl = _maybe_float(previous2_row.get("xl"))
+
         training_rows.append({
             "Kuupäev": sample["current_day"],
             "Põld": sample["field_no"],
             "Intervall p": sample["interval_days"],
             "Saak": target_total,
             "Eelmine saak": previous_total,
+            "XL -1": previous_xl,
+            "XL -2": previous2_xl,
             "T kesk": sum(daily_mean_t) / len(daily_mean_t),
             "Radiatsioon Σ": sum(rad),
             "Radiatsioon/p": sum(rad) / len(rad),
@@ -708,6 +721,8 @@ with tabs[3]:
             display_df.style.format({
                 "Saak": "{:.1f}",
                 "Eelmine saak": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                "XL -1": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                "XL -2": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
                 "T kesk": "{:.1f}",
                 "Radiatsioon Σ": "{:.1f}",
                 "Radiatsioon/p": "{:.1f}",
@@ -865,9 +880,92 @@ with tabs[3]:
                         "Praeguse väikese valimiga ei ole mudel veel baasreeglist parem."
                     )
 
-            eval_df = model_df[["Kuupäev", "Põld", "Saak", "Eelmine saak"]].copy()
+            # --- XL-mälu kontrollkatse -------------------------------------------------
+            # XL on mürane tunnus (korje/sorteerimise kvaliteet mõjutab mõõdetud arvu),
+            # seega me EI asenda baasmodelli. Võrdleme sama walk-forward skeemi peal,
+            # kas ainult varasemate korjete XL (-1 ja -2) annab päriselt lisainfot.
+            raw_xl1 = pd.to_numeric(model_df["XL -1"], errors="coerce").to_numpy(dtype=float)
+            raw_xl2 = pd.to_numeric(model_df["XL -2"], errors="coerce").to_numpy(dtype=float)
+
+            def _fit_predict_walk_forward_xl(train_idx, test_idx, alpha=10.0):
+                train_prev = raw_previous[train_idx]
+                finite_train_prev = train_prev[np.isfinite(train_prev)]
+                prev_fill = float(np.median(finite_train_prev)) if len(finite_train_prev) else 0.0
+                train_prev_missing = (~np.isfinite(train_prev)).astype(float)
+                test_prev = raw_previous[test_idx]
+                test_prev_missing = (~np.isfinite(test_prev)).astype(float)
+                train_prev_filled = np.where(np.isfinite(train_prev), train_prev, prev_fill)
+                test_prev_filled = np.where(np.isfinite(test_prev), test_prev, prev_fill)
+
+                def _fill_from_train(train_values, test_values):
+                    finite = train_values[np.isfinite(train_values)]
+                    fill = float(np.median(finite)) if len(finite) else 0.0
+                    return (
+                        np.where(np.isfinite(train_values), train_values, fill),
+                        np.where(np.isfinite(test_values), test_values, fill),
+                        (~np.isfinite(train_values)).astype(float),
+                        (~np.isfinite(test_values)).astype(float),
+                    )
+
+                tr_xl1, te_xl1, tr_m1, te_m1 = _fill_from_train(raw_xl1[train_idx], raw_xl1[test_idx])
+                tr_xl2, te_xl2, tr_m2, te_m2 = _fill_from_train(raw_xl2[train_idx], raw_xl2[test_idx])
+
+                x_train = np.column_stack([X_base[train_idx], train_prev_filled, tr_xl1, tr_xl2])
+                x_test = np.column_stack([X_base[test_idx], test_prev_filled, te_xl1, te_xl2])
+                means = x_train.mean(axis=0)
+                scales = x_train.std(axis=0)
+                scales[scales < 1e-9] = 1.0
+
+                # Sama disain nagu baasmudelil, aga lisaks XL puudumise indikaatorid.
+                ztr = (x_train - means) / scales
+                zte = (x_test - means) / scales
+                ftr = np.zeros((len(train_idx), 14), dtype=float)
+                fte = np.zeros((len(test_idx), 14), dtype=float)
+                for ri, f in enumerate(fields[train_idx]):
+                    if 1 <= int(f) <= 14:
+                        ftr[ri, int(f)-1] = 1.0
+                for ri, f in enumerate(fields[test_idx]):
+                    if 1 <= int(f) <= 14:
+                        fte[ri, int(f)-1] = 1.0
+                Xtr = np.column_stack([np.ones(len(train_idx)), ztr, train_prev_missing, tr_m1, tr_m2, ftr])
+                Xte = np.column_stack([np.ones(len(test_idx)), zte, test_prev_missing, te_m1, te_m2, fte])
+
+                penalty = np.eye(Xtr.shape[1]) * alpha
+                penalty[0, 0] = 0.0
+                beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ y[train_idx]
+                return np.maximum(Xte @ beta, 0.0)
+
+            predictions_xl = np.full(len(model_df), np.nan, dtype=float)
+            for test_day in sorted(set(dates)):
+                test_idx = np.where(dates == test_day)[0]
+                train_idx = np.where(dates < test_day)[0]
+                if len(train_idx) < min_train_rows:
+                    continue
+                predictions_xl[test_idx] = _fit_predict_walk_forward_xl(train_idx, test_idx)
+
+            same_mask = np.isfinite(predictions) & np.isfinite(predictions_xl)
+            if same_mask.any():
+                base_mae_xlcmp = float(np.mean(np.abs(predictions[same_mask] - y[same_mask])))
+                xl_mae = float(np.mean(np.abs(predictions_xl[same_mask] - y[same_mask])))
+                xl_delta = base_mae_xlcmp - xl_mae
+                st.markdown("###### XL-mälu kontrollkatse")
+                x1, x2, x3 = st.columns(3)
+                x1.metric("Baas MAE", f"{base_mae_xlcmp:.2f} kasti")
+                x2.metric("Baas + XL(-1,-2)", f"{xl_mae:.2f} kasti")
+                x3.metric("Muutus", f"{xl_delta:+.2f} kasti")
+                if xl_delta >= 0.15:
+                    st.success("XL-i kahe eelmise korje mälu parandab praeguses walk-forward testis tulemust. Signaal on olemas, kuid valim on veel väike ja XL ise mürane.")
+                elif xl_delta <= -0.15:
+                    st.warning("XL-i lisamine teeb praeguses walk-forward testis tulemuse halvemaks. Praegu ei tasu XL-i kogusaagimudeli põhisisendiks võtta.")
+                else:
+                    st.info("XL-i lisamine ei muuda praeguse valimi täpsust sisuliselt. Jätame selle jälgimisele, mitte põhisisendiks.")
+                st.caption("Katse kasutab ainult XL-i eelmisest ja üle-eelmisest sama põllu korjest; jooksva korje XL-i ei kasutata. Mõlemad mudelid hinnatakse täpselt samadel ajaliselt ettepoole testitud ridadel.")
+
+            eval_df = model_df[["Kuupäev", "Põld", "Saak", "Eelmine saak", "XL -1", "XL -2"]].copy()
             eval_df["Prognoos"] = predictions
+            eval_df["Prognoos + XL"] = predictions_xl
             eval_df["Viga"] = eval_df["Prognoos"] - eval_df["Saak"]
+            eval_df["Viga + XL"] = eval_df["Prognoos + XL"] - eval_df["Saak"]
             eval_df["|Viga|"] = eval_df["Viga"].abs()
             eval_df = eval_df.sort_values(["Kuupäev", "Põld"], ascending=[False, True])
             eval_df["Kuupäev"] = eval_df["Kuupäev"].map(lambda d: d.strftime("%d.%m"))
@@ -876,8 +974,12 @@ with tabs[3]:
                 eval_df.style.format({
                     "Saak": "{:.1f}",
                     "Eelmine saak": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                    "XL -1": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                    "XL -2": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
                     "Prognoos": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                    "Prognoos + XL": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
                     "Viga": lambda v: "—" if pd.isna(v) else f"{v:+.1f}",
+                    "Viga + XL": lambda v: "—" if pd.isna(v) else f"{v:+.1f}",
                     "|Viga|": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
                 }),
                 use_container_width=True,
