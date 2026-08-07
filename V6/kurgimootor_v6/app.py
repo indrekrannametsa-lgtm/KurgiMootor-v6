@@ -9,12 +9,6 @@ from core import WeatherService
 TODAY = date.today()
 st.set_page_config(page_title="KurgiMootor V6.2", page_icon="🥒", layout="wide")
 
-try:
-    db.ensure_default_plan(TODAY)
-except Exception as exc:
-    st.error(f"Andmebaasi viga: {exc}")
-    st.stop()
-
 # Ilm kontrollitakse automaatselt üks kord päevas. Viga ei takista korjete kasutamist.
 try:
     WeatherService().auto_refresh_if_needed(TODAY)
@@ -27,54 +21,25 @@ st.caption("Saagi ennustamise tööriist. Avaleht on töövoog, mitte ilmarakend
 tabs = st.tabs(["Täna", "Korjed", "Ilm", "Prognoos", "Mootori tähelepanekud"])
 
 with tabs[0]:
-    st.subheader("Täna korjatavad põllud")
-    plan = db.get_plan_for_day(TODAY)
-    harvested = {int(r["field_id"]): r for r in db.get_harvest_for_day(TODAY)}
-    ids = [int(r["field_id"]) for r in plan]
-    for row in plan:
-        field_id = int(row["field_id"])
-        c1, c2, c3 = st.columns([4, 2, 1])
-        c1.markdown(f"### {row['field_name']}")
-        c2.metric("Korjeintervall", f"{int(row['interval_days'])} p")
-        if field_id in harvested:
-            c3.success("Salvestatud")
-        elif c3.button("Eemalda", key=f"remove_{field_id}"):
-            db.remove_plan_field(TODAY, field_id)
-            st.rerun()
-    remaining = [f for f in db.get_all_fields() if int(f["id"]) not in ids]
-    if remaining:
-        labels = {f["name"]: int(f["id"]) for f in remaining}
-        selected = st.selectbox("Lisa tänasesse plaani", list(labels))
-        if st.button("Lisa põld"):
-            db.add_plan_field(TODAY, labels[selected])
-            st.rerun()
-
-    if plan:
-        st.divider()
-        st.subheader("Sisesta tänased korjed")
-        with st.form("harvest_form"):
-            payload = {}
-            for row in plan:
-                field_id = int(row["field_id"])
-                old = harvested.get(field_id, {})
-                st.markdown(f"**{row['field_name']} — {int(row['interval_days'])} päeva**")
-                cols = st.columns(4)
-                payload[field_id] = (
-                    int(row["interval_days"]),
-                    cols[0].number_input("A", 0.0, step=0.1, value=float(old.get("a", 0)), key=f"a{field_id}"),
-                    cols[1].number_input("B", 0.0, step=0.1, value=float(old.get("b", 0)), key=f"b{field_id}"),
-                    cols[2].number_input("C", 0.0, step=0.1, value=float(old.get("c", 0)), key=f"c{field_id}"),
-                    cols[3].number_input("XL", 0.0, step=0.1, value=float(old.get("xl", 0)), key=f"xl{field_id}"),
-                )
-            if st.form_submit_button("Salvesta korjed"):
-                count = 0
-                for order_no, (field_id, values) in enumerate(payload.items(), start=1):
-                    interval, a, b, c, xl = values
-                    if a + b + c + xl > 0:
-                        db.save_harvest(TODAY, field_id, interval, a, b, c, xl, harvest_order=order_no)
-                        count += 1
-                st.success(f"Salvestatud {count} põllu korje.") if count else st.warning("Kõik kogused olid nullid.")
-                st.rerun()
+    st.subheader("Täna")
+    today_rows = db.get_harvest_for_day(TODAY)
+    if today_rows:
+        st.success(f"Täna on salvestatud {len(today_rows)} põllu korje.")
+        today_df = pd.DataFrame(today_rows).rename(columns={
+            "field_no": "Põld",
+            "harvest_order": "Järjekord",
+            "interval_days": "Intervall",
+            "a": "A",
+            "b": "B",
+            "c": "C",
+            "xl": "XL",
+            "total": "Kokku",
+        })
+        wanted = ["Põld", "Järjekord", "Intervall", "A", "B", "C", "XL", "Kokku"]
+        today_df = today_df[[c for c in wanted if c in today_df.columns]]
+        st.dataframe(today_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Tänaseid korjeid pole veel sisestatud. Ava ülevalt „Korjed“ ja sisesta põldude korjed.")
 
 with tabs[1]:
     st.subheader("Korjed")

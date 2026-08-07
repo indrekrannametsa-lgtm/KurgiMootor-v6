@@ -35,28 +35,6 @@ def _execute(query: Any) -> Any:
         raise DatabaseError(str(exc)) from exc
 
 
-def get_all_fields() -> List[Dict[str, Any]]:
-    response = _execute(_client().table("fields").select("id,name").order("id"))
-    return list(response.data or [])
-
-
-def get_plan_for_day(day: date) -> List[Dict[str, Any]]:
-    response = _execute(_client().rpc("get_daily_plan", {"p_plan_date": day.isoformat()}))
-    return list(response.data or [])
-
-
-def ensure_default_plan(day: date) -> None:
-    _execute(_client().rpc("ensure_default_daily_plan", {"p_plan_date": day.isoformat()}))
-
-
-def add_plan_field(day: date, field_id: int) -> None:
-    _execute(_client().rpc("add_daily_plan_field", {"p_plan_date": day.isoformat(), "p_field_id": int(field_id)}))
-
-
-def remove_plan_field(day: date, field_id: int) -> None:
-    _execute(_client().rpc("remove_daily_plan_field", {"p_plan_date": day.isoformat(), "p_field_id": int(field_id)}))
-
-
 def _previous_harvest_date(harvest_date: date, field_no: int) -> date | None:
     response = _execute(
         _client().table("harvests")
