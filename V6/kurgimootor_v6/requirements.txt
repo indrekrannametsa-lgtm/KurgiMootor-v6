@@ -2,3 +2,4 @@ streamlit>=1.36
 pandas>=2.2
 requests>=2.31
 supabase>=2.5
+numpy>=2.0
