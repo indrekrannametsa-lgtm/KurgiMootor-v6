@@ -68,6 +68,23 @@ def _temperature_curve_features(tmins, tmaxs):
 
 
 
+# Astronoomiline päevapikkus Pärnu piirkonna laiuskraadil.
+# Longitude pole päevapikkuse kestuse jaoks vajalik; kasutame geograafilist laiust ~58.38 N.
+DAYLENGTH_LAT = 58.38
+
+def _daylength_hours(day_value):
+    n = int(day_value.timetuple().tm_yday)
+    lat = math.radians(DAYLENGTH_LAT)
+    # NOAA-tüüpi lihtsustatud päikesedeklinatsioon; piisav fotoperioodi tunnuseks.
+    decl = math.radians(23.44) * math.sin(2.0 * math.pi * (284 + n) / 365.0)
+    cos_omega = -math.tan(lat) * math.tan(decl)
+    cos_omega = max(-1.0, min(1.0, cos_omega))
+    omega = math.acos(cos_omega)
+    return 24.0 * omega / math.pi
+
+def _daylength_change_7d(day_value):
+    return _daylength_hours(day_value) - _daylength_hours(day_value - timedelta(days=7))
+
 def _format_field_value(value, digits=1):
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return "—"
@@ -1004,23 +1021,6 @@ with tabs[3]:
             "Baasmudel kasutab Tmin/Tmax mittelineaarset kasvukõverat, muud ilma, korjeintervalli, hooaja faasi ja põllu identiteeti; eelmine saak ei ole prognoosi ankur. "
             "XL prognoositakse eraldi mürasema korjejäägi komponendina. Mõlemat hinnatakse ajaliselt ausa walk-forward testiga."
         )
-
-        # Astronoomiline päevapikkus Pärnu piirkonna laiuskraadil.
-        # Longitude pole päevapikkuse kestuse jaoks vajalik; kasutame geograafilist laiust ~58.38 N.
-        DAYLENGTH_LAT = 58.38
-
-        def _daylength_hours(day_value):
-            n = int(day_value.timetuple().tm_yday)
-            lat = math.radians(DAYLENGTH_LAT)
-            # NOAA-tüüpi lihtsustatud päikesedeklinatsioon; piisav fotoperioodi tunnuseks.
-            decl = math.radians(23.44) * math.sin(2.0 * math.pi * (284 + n) / 365.0)
-            cos_omega = -math.tan(lat) * math.tan(decl)
-            cos_omega = max(-1.0, min(1.0, cos_omega))
-            omega = math.acos(cos_omega)
-            return 24.0 * omega / math.pi
-
-        def _daylength_change_7d(day_value):
-            return _daylength_hours(day_value) - _daylength_hours(day_value - timedelta(days=7))
 
         # Baasmudel on teadlikult puhas bioloogiline mudel: ilm + kasvuaeg + põld + hooaja faas.
         # Eelmise korje saak EI ole baasmudeli kohustuslik sisend; Jäljeotsija võib selle
