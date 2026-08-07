@@ -297,7 +297,7 @@ class WeatherService:
             d += timedelta(days=1)
         return {"saved": saved, "checked": checked}
 
-    def refresh_forecast(self, start_day: date, days: int = 9) -> Dict[str, int]:
+    def refresh_forecast(self, start_day: date, days: int = 10) -> Dict[str, int]:
         end_day = start_day + timedelta(days=days - 1)
         params = {
             "latitude": FARM_LAT,
@@ -465,7 +465,7 @@ class WeatherService:
             errors.append(f"Mõõdetud ilm: {exc}")
 
         try:
-            forecast = self.refresh_forecast(today, 9)
+            forecast = self.refresh_forecast(today, 10)
         except Exception as exc:
             errors.append(f"Prognoos: {exc}")
 

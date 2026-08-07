@@ -637,7 +637,7 @@ with tabs[3]:
     st.markdown("##### Õppimisandmestik")
     st.caption(
         "Üks rida = ühe põllu üks järgmine korje. Ilmatunnused arvutatakse ainult selle põllu "
-        "eelmise ja järgmise korje vahele jäävatest mõõdetud päevadest. Siht on tegelik kogusaak."
+        "eelmise ja järgmise korje vahele jäävatest mõõdetud päevadest. A+B+C põhimudeli siht on tegelik A+B+C; XL hinnatakse eraldi."
     )
 
     training_rows = []
@@ -696,6 +696,7 @@ with tabs[3]:
         if current_a is None or current_b is None or current_c is None or current_xl is None:
             continue
         target_abc = current_a + current_b + current_c
+        target_cb = (current_c / current_b) if current_b > 0 else None
 
         previous_xl = _maybe_float(previous_row.get("xl"))
         previous2_xl = _maybe_float(previous2_row.get("xl"))
@@ -721,8 +722,8 @@ with tabs[3]:
 
         previous_xl_share = (previous_xl / previous_total) if (previous_xl is not None and previous_total and previous_total > 0) else None
         previous2_xl_share = (previous2_xl / previous2_total) if (previous2_xl is not None and previous2_total and previous2_total > 0) else None
-        previous_cb = (previous_c / previous_b) if (previous_c is not None and previous_b and previous_b > 0) else None
-        previous2_cb = (previous2_c / previous2_b) if (previous2_c is not None and previous2_b and previous2_b > 0) else None
+        previous_cb = None if prev_quality == "hinnanguline" else ((previous_c / previous_b) if (previous_c is not None and previous_b and previous_b > 0) else None)
+        previous2_cb = None if prev2_quality == "hinnanguline" else ((previous2_c / previous2_b) if (previous2_c is not None and previous2_b and previous2_b > 0) else None)
         yield_trend = (previous_abc - previous2_abc) if (previous_abc is not None and previous2_abc is not None) else None
 
         def _tail_weather(n):
@@ -746,6 +747,7 @@ with tabs[3]:
             "Intervall p": sample["interval_days"],
             "Saak": target_total,
             "ABC saak": target_abc,
+            "C/B siht": target_cb,
             "Eelmine ABC": previous_abc,
             "Eelmine saak": previous_total,
             "XL -1": previous_xl,
@@ -781,7 +783,7 @@ with tabs[3]:
         t3.metric("Keskmine A+B+C", f"{training_df['ABC saak'].mean():.1f} kasti")
 
         visible_training_cols = [
-            "Kuupäev", "Põld", "Intervall p", "ABC saak", "XL", "Saak", "Eelmine ABC",
+            "Kuupäev", "Põld", "Intervall p", "ABC saak", "C/B siht", "XL", "Saak", "Eelmine ABC",
             "T kesk", "Radiatsioon Σ", "Radiatsioon/p", "Sademed Σ",
             "Niiskus kesk", "ET0 Σ", "Tuul kesk", "A", "B", "C", "Andmekvaliteet",
         ]
@@ -790,6 +792,7 @@ with tabs[3]:
         st.dataframe(
             display_df.style.format({
                 "ABC saak": "{:.1f}",
+                "C/B siht": lambda v: "—" if pd.isna(v) else f"{float(v):.2f}",
                 "Saak": "{:.1f}",
                 "Eelmine ABC": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
                 "T kesk": "{:.1f}",
@@ -825,14 +828,21 @@ with tabs[3]:
         st.markdown("##### A+B+C põhimudel + eraldi XL-komponent")
         st.caption(
             "Põhimudel ennustab ainult A+B+C saaki, mis on taime tootmise objektiivsem osa. "
+            "Baasmudel kasutab ilma, korjeintervalli, hooaja faasi ja põllu identiteeti; eelmine saak ei ole kohustuslik sisend. "
             "XL prognoositakse eraldi mürasema korjejäägi komponendina. Mõlemat hinnatakse ajaliselt ausa walk-forward testiga."
         )
 
+        # Baasmudel on teadlikult puhas bioloogiline mudel: ilm + kasvuaeg + põld + hooaja faas.
+        # Eelmise korje saak EI ole baasmudeli kohustuslik sisend; Jäljeotsija võib selle
+        # eraldi kandidaadina sisse lubada ainult siis, kui aus walk-forward test tõestab kasu.
         base_cont_cols = [
-            "Intervall p", "T kesk", "Radiatsioon Σ", "Radiatsioon/p",
+            "Intervall p", "Hooajapäev", "T kesk", "Radiatsioon Σ", "Radiatsioon/p",
             "Sademed Σ", "Niiskus kesk", "ET0 Σ", "Tuul kesk",
         ]
         model_df = training_df.copy().sort_values(["Kuupäev", "Põld"]).reset_index(drop=True)
+        model_df["Hooajapäev"] = pd.to_datetime(model_df["Kuupäev"]).map(
+            lambda d: (d.date() - date(2026, 7, 1)).days
+        )
         fields = model_df["Põld"].astype(int).to_numpy()
         dates = pd.to_datetime(model_df["Kuupäev"]).dt.date.to_numpy()
         X_base = model_df[base_cont_cols].astype(float).to_numpy()
@@ -840,10 +850,14 @@ with tabs[3]:
         y_abc = pd.to_numeric(model_df["ABC saak"], errors="coerce").to_numpy(dtype=float)
         y_xl = pd.to_numeric(model_df["XL"], errors="coerce").to_numpy(dtype=float)
         y_total = pd.to_numeric(model_df["Saak"], errors="coerce").to_numpy(dtype=float)
+        y_cb = pd.to_numeric(model_df["C/B siht"], errors="coerce").to_numpy(dtype=float)
+        log_y_cb = np.where(np.isfinite(y_cb) & (y_cb > 0), np.log(y_cb), np.nan)
         raw_prev_abc = pd.to_numeric(model_df["Eelmine ABC"], errors="coerce").to_numpy(dtype=float)
         raw_prev_total = pd.to_numeric(model_df["Eelmine saak"], errors="coerce").to_numpy(dtype=float)
         raw_xl1 = pd.to_numeric(model_df["XL -1"], errors="coerce").to_numpy(dtype=float)
         raw_xl2 = pd.to_numeric(model_df["XL -2"], errors="coerce").to_numpy(dtype=float)
+        raw_cb1 = pd.to_numeric(model_df["C/B -1"], errors="coerce").to_numpy(dtype=float)
+        raw_cb2 = pd.to_numeric(model_df["C/B -2"], errors="coerce").to_numpy(dtype=float)
 
         def _build_ridge_design(train_idx, test_idx, extra_arrays):
             tr_parts = [X_base[train_idx]]
@@ -881,12 +895,13 @@ with tabs[3]:
             Xte = np.column_stack([np.ones(len(test_idx)), zte, te_missing, fte])
             return Xtr, Xte, means, scales, fills
 
-        def _ridge_walk_predict(target, extra_arrays, train_idx, test_idx, alpha=10.0):
+        def _ridge_walk_predict(target, extra_arrays, train_idx, test_idx, alpha=10.0, floor_zero=True):
             Xtr, Xte, _, _, _ = _build_ridge_design(train_idx, test_idx, extra_arrays)
             penalty = np.eye(Xtr.shape[1]) * alpha
             penalty[0, 0] = 0.0
             beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ target[train_idx]
-            return np.maximum(Xte @ beta, 0.0)
+            values = Xte @ beta
+            return np.maximum(values, 0.0) if floor_zero else values
 
         min_train_rows = 10
         abc_predictions = np.full(len(model_df), np.nan, dtype=float)
@@ -896,18 +911,29 @@ with tabs[3]:
             train_idx = np.where(dates < test_day)[0]
             if len(train_idx) < min_train_rows:
                 continue
-            abc_predictions[test_idx] = _ridge_walk_predict(y_abc, [raw_prev_abc], train_idx, test_idx)
+            # A+B+C BAASMudel: ainult ilm + intervall + hooajapäev + põllu identiteet.
+            # Eelmist saaki siin tahtlikult EI kasutata.
+            abc_predictions[test_idx] = _ridge_walk_predict(y_abc, [], train_idx, test_idx)
             # XL-mudel saab kasutada varasemaid XL-e ning eelmise korje ABC/kogusaaki.
             xl_predictions[test_idx] = _ridge_walk_predict(
                 y_xl, [raw_xl1, raw_xl2, raw_prev_abc, raw_prev_total], train_idx, test_idx
             )
+
+        # C/B on eraldi kvaliteedimudel. Õpime log(C/B), et prognoos jääks alati positiivseks.
+        cb_predictions = np.full(len(model_df), np.nan, dtype=float)
+        for test_day in sorted(set(dates)):
+            test_idx = np.where(dates == test_day)[0]
+            train_idx = np.where((dates < test_day) & np.isfinite(log_y_cb))[0]
+            if len(train_idx) < min_train_rows:
+                continue
+            log_pred = _ridge_walk_predict(log_y_cb, [raw_cb1], train_idx, test_idx, floor_zero=False)
+            cb_predictions[test_idx] = np.exp(np.clip(log_pred, np.log(0.10), np.log(10.0)))
 
         valid_abc = np.isfinite(abc_predictions)
         valid_xl = np.isfinite(xl_predictions)
         valid_both = valid_abc & valid_xl
         predictions = abc_predictions  # Jäljeotsija baasiks jääb objektiivne A+B+C mudel.
         y = y_abc
-        raw_previous = raw_prev_abc
         valid_pred = valid_abc
         current_test_mae = None
         current_total_test_mae = None
@@ -934,9 +960,10 @@ with tabs[3]:
             r2.metric("XL MAE", "—" if xl_mae is None else f"{xl_mae:.1f} kasti")
             r3.metric("Kogu MAE", "—" if total_mae is None else f"{total_mae:.1f} kasti")
             r4.metric("A+B+C ±2 sees", f"{abc_within2:.0f}%")
+            tested_days_abc = len(set(dates[np.where(valid_abc)[0]]))
             st.caption(
-                f"A+B+C testitud ridu: {int(valid_abc.sum())}/{len(model_df)} · RMSE {abc_rmse:.1f} · nihe {abc_bias:+.1f}. "
-                "Kogu = A+B+C prognoos + eraldi XL prognoos."
+                f"A+B+C testitud: {int(valid_abc.sum())}/{len(model_df)} rida · {tested_days_abc} testipäeva · "
+                f"RMSE {abc_rmse:.1f} · nihe {abc_bias:+.1f}. Kogu = A+B+C prognoos + eraldi XL prognoos."
             )
 
             baseline_mask = valid_abc & np.isfinite(raw_prev_abc)
@@ -979,7 +1006,9 @@ with tabs[3]:
         # Jäljeotsija v2 — automaatne champion-valik A+B+C põhimudelile
         # -------------------------------------------------------------------------
         operational_candidate_groups = {
-            "A+B+C trend 2 korjet": ["Eelmine2 ABC", "ABC trend"],
+            # Saagimälu ei ole enam baasi osa. Need read on teadlikult eraldi kandidaadid.
+            "Eelmine A+B+C": ["Eelmine ABC"],
+            "A+B+C trend 2 korjet": ["Eelmine ABC", "Eelmine2 ABC", "ABC trend"],
             "Korjejääk / kõrge eelkorje": ["Eelmine saak", "XL -1", "XL -2", "XL osakaal -1", "XL osakaal -2"],
             "XL osakaal 2 korjet": ["XL osakaal -1", "XL osakaal -2"],
             "Viimase 1 päeva ilm": ["T viim1", "Rad viim1", "Sade viim1", "ET0 viim1", "Niiskus viim1"],
@@ -998,7 +1027,9 @@ with tabs[3]:
                 train_idx = np.where(dates < test_day)[0]
                 if len(train_idx) < min_train_rows:
                     continue
-                extra_arrays = [raw_previous] + [raw_extra[:, j] for j in range(raw_extra.shape[1])]
+                # Kandidaat saab ainult need lisatunnused, mis tema grupis on nimetatud.
+                # Eelmist saaki ei lisata enam vaikimisi ühelegi kandidaadile.
+                extra_arrays = [raw_extra[:, j] for j in range(raw_extra.shape[1])]
                 preds[test_idx] = _ridge_walk_predict(y, extra_arrays, train_idx, test_idx)
             return preds
 
@@ -1070,7 +1101,7 @@ with tabs[3]:
         if champion_stats:
             ch3.metric("Eelis baasi ees", f"{champion_stats['Paranemine']:+.2f} kasti")
             st.success(
-                f"5 päeva prognoos kasutab automaatselt championit **{champion_name}**. "
+                f"9 päeva prognoos kasutab automaatselt championit **{champion_name}**. "
                 f"See võitis {champion_stats['Võidab ridu %']:.0f}% samadest testiridadest ja "
                 f"parandas MAE-d {champion_stats['Paranemine']:.2f} kasti. "
                 "Champion vaadatakse iga uue korjega uuesti üle."
@@ -1079,18 +1110,125 @@ with tabs[3]:
             ch3.metric("Eelis baasi ees", "0.00 kasti")
             st.info(
                 "Ükski lisatunnuste grupp ei läbinud täna stabiilsuslävendit. "
-                "5 päeva prognoos kasutab seetõttu baasmudelit — see on teadlik turvapiirang, mitte veaolukord."
+                "9 päeva prognoos kasutab seetõttu puhast ilma + intervalli + hooaja faasi + põllu baasmudelit. "
+                "Eelmist saaki ei kasutata — see on teadlik turvapiirang, mitte veaolukord."
             )
 
+        # -------------------------------------------------------------------------
+        # C/B kvaliteedimootor — eraldi champion, ei mõjuta A+B+C championit
+        # -------------------------------------------------------------------------
+        st.markdown("##### C/B kvaliteedimootor")
+        st.caption(
+            "C/B prognoositakse eraldi. Baasmudel kasutab korjeintervalli, ilma ja eelmist usaldusväärset C/B suhet. "
+            "Jäljeotsija võib lisada ainult ajaliselt stabiilselt kasulikke tunnuseid."
+        )
+
+        valid_cb_base = np.isfinite(cb_predictions) & np.isfinite(y_cb)
+        cb_base_mae = float(np.mean(np.abs(cb_predictions[valid_cb_base] - y_cb[valid_cb_base]))) if valid_cb_base.any() else None
+
+        cb_candidate_groups = {
+            "C/B mälu 2 korjet": ["C/B -2"],
+            "A+B+C trend": ["Eelmine2 ABC", "ABC trend"],
+            "XL / korjejääk": ["XL -1", "XL -2", "XL osakaal -1", "XL osakaal -2"],
+            "Viimase 1 päeva ilm": ["T viim1", "Rad viim1", "Sade viim1", "ET0 viim1", "Niiskus viim1"],
+            "Viimase 2 päeva ilm": ["T viim2", "Rad viim2", "Sade viim2", "ET0 viim2", "Niiskus viim2"],
+            "Viimase 3 päeva ilm": ["T viim3", "Rad viim3", "Sade viim3", "ET0 viim3", "Niiskus viim3"],
+        }
+
+        def _cb_walk_with_extra(extra_cols, alpha=10.0):
+            raw_extra = model_df[extra_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float) if extra_cols else np.empty((len(model_df), 0))
+            preds = np.full(len(model_df), np.nan, dtype=float)
+            for test_day in sorted(set(dates)):
+                test_idx = np.where(dates == test_day)[0]
+                train_idx = np.where((dates < test_day) & np.isfinite(log_y_cb))[0]
+                if len(train_idx) < min_train_rows:
+                    continue
+                extra_arrays = [raw_cb1] + [raw_extra[:, j] for j in range(raw_extra.shape[1])]
+                log_pred = _ridge_walk_predict(log_y_cb, extra_arrays, train_idx, test_idx, alpha=alpha, floor_zero=False)
+                preds[test_idx] = np.exp(np.clip(log_pred, np.log(0.10), np.log(10.0)))
+            return preds
+
+        def _cb_stability_stats(candidate_pred):
+            mask = np.isfinite(cb_predictions) & np.isfinite(candidate_pred) & np.isfinite(y_cb)
+            idx = np.where(mask)[0]
+            if len(idx) == 0:
+                return None
+            base_abs = np.abs(cb_predictions[idx] - y_cb[idx])
+            cand_abs = np.abs(candidate_pred[idx] - y_cb[idx])
+            improvement = float(base_abs.mean() - cand_abs.mean())
+            win_share = float(np.mean(cand_abs < base_abs))
+            unique_days = sorted(set(dates[idx]))
+            halves = np.array_split(np.array(unique_days, dtype=object), 2)
+            half_improvements = []
+            for half in halves:
+                day_set = set(half.tolist())
+                h = np.array([i for i in idx if dates[i] in day_set], dtype=int)
+                if len(h):
+                    half_improvements.append(float(
+                        np.mean(np.abs(cb_predictions[h] - y_cb[h])) - np.mean(np.abs(candidate_pred[h] - y_cb[h]))
+                    ))
+            min_half = min(half_improvements) if half_improvements else -999.0
+            stable = bool(len(idx) >= 12 and improvement >= 0.05 and win_share >= 0.50 and min_half >= -0.03)
+            return {
+                "Baas MAE": float(base_abs.mean()), "Katse MAE": float(cand_abs.mean()),
+                "Paranemine": improvement, "Võidab ridu %": win_share * 100.0,
+                "Halvim pool": min_half, "Testiridu": int(len(idx)), "Stabiilne": stable,
+            }
+
+        cb_candidate_predictions = {}
+        cb_trace_rows = []
+        for name, cols in cb_candidate_groups.items():
+            pred = _cb_walk_with_extra(cols)
+            cb_candidate_predictions[name] = pred
+            stats = _cb_stability_stats(pred)
+            if stats:
+                cb_trace_rows.append({"Jälg": name, **stats})
+
+        cb_champion_name = "C/B baasmudel"
+        cb_champion_cols = []
+        cb_champion_mae = cb_base_mae
+        cb_champion_stats = None
+        cb_stable = []
+        for name, cols in cb_candidate_groups.items():
+            stats = _cb_stability_stats(cb_candidate_predictions.get(name)) if name in cb_candidate_predictions else None
+            if stats and stats["Stabiilne"]:
+                cb_stable.append((stats["Katse MAE"], name, cols, stats))
+        if cb_stable:
+            cb_stable.sort(key=lambda x: x[0])
+            cb_champion_mae, cb_champion_name, cb_champion_cols, cb_champion_stats = cb_stable[0]
+
+        cb1, cb2, cb3 = st.columns(3)
+        cb1.metric("C/B champion", cb_champion_name)
+        cb2.metric("C/B MAE", "—" if cb_champion_mae is None else f"{cb_champion_mae:.2f}")
+        cb_test_rows = int(valid_cb_base.sum())
+        cb_test_days = len(set(dates[np.where(valid_cb_base)[0]])) if valid_cb_base.any() else 0
+        cb3.metric("Testitud", f"{cb_test_rows}/{len(model_df)} rida")
+        st.caption(f"C/B aus test hõlmab {cb_test_days} testipäeva. Madalam MAE on parem.")
+        if cb_champion_stats:
+            st.success(
+                f"C/B prognoos kasutab **{cb_champion_name}**: MAE paranemine {cb_champion_stats['Paranemine']:.2f}, "
+                f"võitis {cb_champion_stats['Võidab ridu %']:.0f}% samadest testiridadest."
+            )
+        else:
+            st.info("Ükski C/B lisajälg ei läbinud stabiilsuslävendit; kvaliteediprognoos kasutab C/B baasmudelit.")
+
+        if cb_trace_rows:
+            with st.expander("Näita C/B jäljeotsija tulemusi"):
+                cb_trace_df = pd.DataFrame(cb_trace_rows).sort_values(["Stabiilne", "Paranemine"], ascending=[False, False])
+                st.dataframe(cb_trace_df.style.format({
+                    "Baas MAE": "{:.2f}", "Katse MAE": "{:.2f}", "Paranemine": "{:+.2f}",
+                    "Võidab ridu %": "{:.0f}%", "Halvim pool": "{:+.2f}",
+                }), use_container_width=True, hide_index=True)
+
         def _fit_full_generic(target, extra_arrays, alpha=10.0):
-            idx = np.arange(len(model_df))
+            idx = np.where(np.isfinite(target))[0]
             Xtr, _, means, scales, fills = _build_ridge_design(idx, idx, extra_arrays)
             penalty = np.eye(Xtr.shape[1]) * alpha
             penalty[0, 0] = 0.0
             beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ target
             return {"beta": beta, "means": means, "scales": scales, "fills": fills, "n_extra": len(extra_arrays)}
 
-        def _predict_full_generic(model, field_no, base_values, extra_values):
+        def _predict_full_generic(model, field_no, base_values, extra_values, floor_zero=True):
             x = list(base_values)
             miss = []
             for i, value in enumerate(extra_values):
@@ -1106,29 +1244,36 @@ with tabs[3]:
             if 1 <= int(field_no) <= 14:
                 onehot[0, int(field_no) - 1] = 1.0
             Xp = np.column_stack([np.ones(1), z, np.array([miss], dtype=float), onehot])
-            return float(max(0.0, (Xp @ model["beta"])[0]))
+            value = float((Xp @ model["beta"])[0])
+            return max(0.0, value) if floor_zero else value
 
         champion_extra_arrays = [
             pd.to_numeric(model_df[c], errors="coerce").to_numpy(dtype=float) for c in champion_cols
         ]
-        full_abc_model = _fit_full_generic(y_abc, [raw_prev_abc] + champion_extra_arrays)
+        full_abc_model = _fit_full_generic(y_abc, champion_extra_arrays)
         full_xl_model = _fit_full_generic(y_xl, [raw_xl1, raw_xl2, raw_prev_abc, raw_prev_total])
+        cb_champion_extra_arrays = [
+            pd.to_numeric(model_df[c], errors="coerce").to_numpy(dtype=float) for c in cb_champion_cols
+        ]
+        full_cb_model = _fit_full_generic(log_y_cb, [raw_cb1] + cb_champion_extra_arrays)
 
         # -------------------------------------------------------------------------
-        # 5 päeva ette: A+B+C + eraldi XL
+        # 9 päeva ette: A+B+C + eraldi XL
         # -------------------------------------------------------------------------
-        st.markdown("##### 5 päeva saagiprognoos")
+        st.markdown("##### 9 päeva saagiprognoos")
         st.caption(
-            f"A+B+C kasutab tänast champion-mootorit: {champion_name}. XL lisatakse eraldi korjejäägi komponendina. "
+            f"A+B+C kasutab tänast champion-mootorit: {champion_name}. Baasmudel põhineb ilmal, intervallil, "
+            f"hooaja faasil ja põllu identiteedil — eelmine saak ei ole kohustuslik sisend. "
+            f"C/B kasutab eraldi championit: {cb_champion_name}. XL lisatakse eraldi korjejäägi komponendina. "
             "Korjevahemiku möödunud päevadel kasutatakse mõõdetud ilma ja tulevastel päevadel 9 päeva ilmaprognoosi."
         )
         st.info(
             "Oluline: ajalooline walk-forward MAE mõõdab saagimudelit realiseerunud mõõdetud ilma peal. "
-            "Päris 1–5 päeva prognoos sisaldab lisaks ilmaprognoosi viga. Operatiivset täpsust hakkame mõõtma "
+            "Päris 1–9 päeva prognoos sisaldab lisaks ilmaprognoosi viga. Operatiivset täpsust hakkame mõõtma "
             "yield_forecasts snapshot'ide põhjal, kui tegelikud korjed saabuvad."
         )
 
-        future_weather_end = TODAY + timedelta(days=8)
+        future_weather_end = TODAY + timedelta(days=9)
         all_weather_rows = db.get_weather_rows(readiness_start, future_weather_end)
         all_weather_by_day = {str(r.get("weather_date")): r for r in all_weather_rows}
         weather_feature_names = [
@@ -1178,6 +1323,7 @@ with tabs[3]:
             mean_t = [(r["temp_min_c"] + r["temp_max_c"]) / 2 for r in rows]
             wx = {
                 "Intervall p": (target_day - previous_day).days,
+                "Hooajapäev": (target_day - date(2026, 7, 1)).days,
                 "T kesk": float(np.mean(mean_t)),
                 "Radiatsioon Σ": float(np.sum([r["radiation_mj_m2"] for r in rows])),
                 "Radiatsioon/p": float(np.mean([r["radiation_mj_m2"] for r in rows])),
@@ -1198,6 +1344,7 @@ with tabs[3]:
 
         def _champion_feature_values(state, wx):
             values = {
+                "Eelmine ABC": state.get("abc"),
                 "Eelmine2 ABC": state.get("abc_prev"),
                 "ABC trend": (state.get("abc") - state.get("abc_prev")) if state.get("abc") is not None and state.get("abc_prev") is not None else None,
                 "Eelmine saak": state.get("total"),
@@ -1211,6 +1358,21 @@ with tabs[3]:
                     values[k] = v
             return [values.get(c) for c in champion_cols]
 
+        def _cb_champion_feature_values(state, wx):
+            values = {
+                "C/B -2": state.get("cb_prev"),
+                "Eelmine2 ABC": state.get("abc_prev"),
+                "ABC trend": (state.get("abc") - state.get("abc_prev")) if state.get("abc") is not None and state.get("abc_prev") is not None else None,
+                "XL -1": state.get("xl"),
+                "XL -2": state.get("xl_prev"),
+                "XL osakaal -1": (state.get("xl") / state.get("total")) if state.get("xl") is not None and state.get("total") not in (None, 0) else None,
+                "XL osakaal -2": (state.get("xl_prev") / state.get("total_prev")) if state.get("xl_prev") is not None and state.get("total_prev") not in (None, 0) else None,
+            }
+            for k, v in wx.items():
+                if k.startswith(("T viim", "Rad viim", "Sade viim", "ET0 viim", "Niiskus viim")):
+                    values[k] = v
+            return [values.get(c) for c in cb_champion_cols]
+
         def _predict_one(field_no, state, target_day):
             wx, estimated_days = _weather_window_for_prediction(state["date"], target_day)
             if wx is None:
@@ -1218,14 +1380,20 @@ with tabs[3]:
             base_values = [wx[c] for c in base_cont_cols]
             abc_pred = _predict_full_generic(
                 full_abc_model, field_no, base_values,
-                [state.get("abc")] + _champion_feature_values(state, wx),
+                _champion_feature_values(state, wx),
             )
             xl_pred = _predict_full_generic(
                 full_xl_model, field_no, base_values,
                 [state.get("xl"), state.get("xl_prev"), state.get("abc"), state.get("total")],
             )
+            cb_log_pred = _predict_full_generic(
+                full_cb_model, field_no, base_values,
+                [state.get("cb")] + _cb_champion_feature_values(state, wx),
+                floor_zero=False,
+            )
+            cb_pred = float(np.exp(np.clip(cb_log_pred, np.log(0.10), np.log(10.0))))
             return {
-                "abc": abc_pred, "xl": xl_pred, "total": abc_pred + xl_pred,
+                "abc": abc_pred, "xl": xl_pred, "cb": cb_pred, "total": abc_pred + xl_pred,
                 "interval": wx["Intervall p"], "estimated_days": estimated_days or set(),
             }
 
@@ -1244,6 +1412,7 @@ with tabs[3]:
                     "date": d, "abc": a + b + c,
                     "abc_prev": old.get("abc") if old else None,
                     "xl": xl, "xl_prev": old.get("xl") if old else None,
+                    "cb": (c / b) if b > 0 else None, "cb_prev": old.get("cb") if old else None,
                     "total": total_value, "total_prev": old.get("total") if old else None,
                     "source": "tegelik",
                 }
@@ -1263,6 +1432,7 @@ with tabs[3]:
                         "date": TODAY, "abc": a+b+c,
                         "abc_prev": old.get("abc") if old else None,
                         "xl": xl, "xl_prev": old.get("xl") if old else None,
+                        "cb": (c / b) if b > 0 else None, "cb_prev": old.get("cb") if old else None,
                         "total": total, "total_prev": old.get("total") if old else None,
                         "source": "tegelik",
                     }
@@ -1277,6 +1447,7 @@ with tabs[3]:
                 field_state[int(f)] = {
                     "date": TODAY, "abc": nowcast["abc"], "abc_prev": prev.get("abc"),
                     "xl": nowcast["xl"], "xl_prev": prev.get("xl"),
+                    "cb": nowcast["cb"], "cb_prev": prev.get("cb"),
                     "total": nowcast["total"], "total_prev": prev.get("total"),
                     "source": "prognoos",
                 }
@@ -1286,41 +1457,42 @@ with tabs[3]:
         first_field = _next_field(today_plan[-1]) if today_plan else 1
         current_first = first_field
         any_weather_imputation = set()
-        for offset in range(1, 6):
+        for offset in range(1, 10):
             target_day = TODAY + timedelta(days=offset)
             day_fields = [current_first, _next_field(current_first), _next_field(_next_field(current_first))]
             day_rows = []
             for f in day_fields:
                 prev = field_state.get(int(f))
                 if not prev:
-                    day_rows.append({"Põld": f, "A+B+C": None, "XL": None, "Kokku": None, "Intervall": None, "Alus": "puudub", "Hinnanguline ilm": "—"})
+                    day_rows.append({"Põld": f, "A+B+C": None, "C/B": None, "XL": None, "Kokku": None, "Intervall": None, "Alus": "puudub", "Hinnanguline ilm": "—"})
                     continue
                 result = _predict_one(int(f), prev, target_day)
                 if not result:
-                    day_rows.append({"Põld": f, "A+B+C": None, "XL": None, "Kokku": None, "Intervall": (target_day-prev["date"]).days, "Alus": prev["source"], "Hinnanguline ilm": "puudub"})
+                    day_rows.append({"Põld": f, "A+B+C": None, "C/B": None, "XL": None, "Kokku": None, "Intervall": (target_day-prev["date"]).days, "Alus": prev["source"], "Hinnanguline ilm": "puudub"})
                     continue
                 any_weather_imputation.update(result["estimated_days"])
                 source_label = "tegelik eelkorje" if prev["source"] == "tegelik" else "prognoositud eelkorje"
                 day_rows.append({
-                    "Põld": f, "A+B+C": result["abc"], "XL": result["xl"], "Kokku": result["total"],
+                    "Põld": f, "A+B+C": result["abc"], "C/B": result["cb"], "XL": result["xl"], "Kokku": result["total"],
                     "Intervall": result["interval"], "Alus": source_label,
                     "Hinnanguline ilm": ", ".join(sorted(d.strftime("%d.%m") for d in result["estimated_days"])) or "—",
                 })
                 field_state[int(f)] = {
                     "date": target_day, "abc": result["abc"], "abc_prev": prev.get("abc"),
                     "xl": result["xl"], "xl_prev": prev.get("xl"),
+                    "cb": result["cb"], "cb_prev": prev.get("cb"),
                     "total": result["total"], "total_prev": prev.get("total"),
                     "source": "prognoos",
                 }
             forecast_days.append((target_day, day_rows))
             current_first = _next_field(day_fields[-1])
 
-        # Salvestame 5 päeva prognoosid eraldi ajalukku. Sama päeva rerun uuendab
+        # Salvestame 9 päeva prognoosid eraldi ajalukku. Sama päeva rerun uuendab
         # olemasolevat snapshot'i; järgmine päev loob uue lead-time snapshot'i.
         # Mudeliversioon tähistab champion-valiku raamistikku, mitte tänase võitja nime.
         # Nii uuendab sama päeva rerun sama operatiivset snapshot'i ka siis, kui champion
         # uue korje järel päeva jooksul muutub. Võitja nimi salvestub basis-väljale.
-        MODEL_VERSION = "v6.3-champion-v1"
+        MODEL_VERSION = "v6.3-weather-first-champion-v3"
         forecast_payloads = []
         for target_day, rows_day in forecast_days:
             for row in rows_day:
@@ -1332,10 +1504,11 @@ with tabs[3]:
                     "field_no": int(row["Põld"]),
                     "lead_days": (target_day - TODAY).days,
                     "abc_forecast": float(row["A+B+C"]),
+                    "cb_forecast": float(row["C/B"]) if row.get("C/B") is not None else None,
                     "xl_forecast": float(row["XL"]),
                     "total_forecast": float(row["Kokku"]),
                     "interval_days": row.get("Intervall"),
-                    "basis": f"{row.get('Alus') or ''}; champion={champion_name}",
+                    "basis": f"{row.get('Alus') or ''}; champion={champion_name}; cb_champion={cb_champion_name}",
                     "estimated_weather_days": row.get("Hinnanguline ilm") or "",
                     "model_version": MODEL_VERSION,
                 })
@@ -1359,10 +1532,24 @@ with tabs[3]:
             vals = [r["Kokku"] for r in rows_day if r["Kokku"] is not None]
             total_day = sum(vals) if len(vals) == 3 else None
             total_text = f"{_fmt(total_day)} kasti" if total_day is not None else "prognoos puudulik"
-            st.markdown(f"### {_short_date(target_day)}  {total_text}")
+            lead = (target_day - TODAY).days
+            if lead >= 6:
+                header_html = (
+                    '<div style="background:#fff3cd;border:1px solid #ffe69c;border-radius:10px;'
+                    'padding:8px 12px;margin:12px 0 6px 0;">'
+                    f'<span style="font-size:1.45rem;font-weight:700;">{_short_date(target_day)}&emsp;&emsp;{total_text}</span>'
+                    f'<span style="margin-left:10px;font-size:0.92rem;">🟡 trendiprognoos · {lead} p ette</span>'
+                    '</div>'
+                )
+                st.markdown(header_html, unsafe_allow_html=True)
+            else:
+                confidence = "kõrgem kindlus" if lead <= 3 else "keskmine kindlus"
+                st.markdown(f"### {_short_date(target_day)}  {total_text}")
+                st.caption(f"{lead} p ette · {confidence}")
             day_df = pd.DataFrame(rows_day)
             st.dataframe(day_df.style.format({
                 "A+B+C": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
+                "C/B": lambda v: "—" if pd.isna(v) else f"{float(v):.2f}",
                 "XL": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
                 "Kokku": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
                 "Intervall": lambda v: "—" if pd.isna(v) else f"{int(v)} p",
@@ -1370,14 +1557,19 @@ with tabs[3]:
 
         abc_mae_text = f"{current_test_mae:.1f} kasti/põld" if current_test_mae is not None else "veel hindamata"
         total_mae_text = f"{current_total_test_mae:.1f} kasti/põld" if current_total_test_mae is not None else "veel hindamata"
-        st.caption(f"A+B+C ajaline testviga: {abc_mae_text}. Kogusaagi (ABC+XL) testviga: {total_mae_text}. Kaugematel päevadel kasvab ebakindlus rekursiivse eelkorje tõttu.")
+        lag_note = " Kui champion kasutab saagimälu, kasvab kaugemates 6–9 päeva prognoosides rekursioonirisk." if any(c in champion_cols for c in ["Eelmine ABC", "Eelmine2 ABC", "ABC trend", "Eelmine saak"]) else ""
+        st.caption(
+            f"A+B+C ajaline testviga: {abc_mae_text}. Kogusaagi (ABC+XL) testviga: {total_mae_text}. "
+            f"1–3 päeva on operatiivne vaade, 4–5 päeva planeerimisvaade ja 6–9 päeva kollasega märgitud trendiprognoos. "
+            f"Kaugematel päevadel kasvab ebakindlus eelkõige ilmaprognoosi tõttu.{lag_note}"
+        )
 
         # -------------------------------------------------------------------------
         # Salvestatud prognoos vs tegelik
         # -------------------------------------------------------------------------
         if forecast_store_ok:
             st.markdown("##### Prognooside ajalugu")
-            st.caption("Iga päev jääb alles uus 1–5 päeva ette tehtud snapshot. Tegelik korje liidetakse kuvamisel automaatselt harvests tabelist.")
+            st.caption("Iga päev jääb alles uus 1–9 päeva ette tehtud snapshot. Tegelik korje liidetakse kuvamisel automaatselt harvests tabelist.")
             try:
                 saved_forecasts_all = db.get_yield_forecasts(limit=1000)
                 saved_forecasts = [r for r in saved_forecasts_all if str(r.get("model_version") or "") == MODEL_VERSION]
@@ -1389,7 +1581,7 @@ with tabs[3]:
                 try:
                     key = (str(hr.get("harvest_date")), int(hr.get("field_no")))
                     a = float(hr.get("a")); b = float(hr.get("b")); c = float(hr.get("c")); xl = float(hr.get("xl")); total = float(hr.get("total"))
-                    actual_lookup[key] = {"abc": a+b+c, "xl": xl, "total": total}
+                    actual_lookup[key] = {"abc": a+b+c, "cb": (c/b) if b > 0 else None, "xl": xl, "total": total}
                 except (TypeError, ValueError):
                     continue
 
@@ -1409,9 +1601,11 @@ with tabs[3]:
                     "Põld": int(fr.get("field_no")),
                     "Ette": int(fr.get("lead_days") or 0),
                     "ABC prognoos": abc_f,
+                    "C/B prognoos": float(fr.get("cb_forecast")) if fr.get("cb_forecast") is not None else None,
                     "XL prognoos": xl_f,
                     "Kokku prognoos": total_f,
                     "ABC tegelik": actual.get("abc") if actual else None,
+                    "C/B tegelik": actual.get("cb") if actual else None,
                     "XL tegelik": actual.get("xl") if actual else None,
                     "Kokku tegelik": actual.get("total") if actual else None,
                     "Kogu viga": (total_f - actual["total"]) if actual else None,
@@ -1433,8 +1627,9 @@ with tabs[3]:
                 st.dataframe(
                     hist_show.style.format({
                         "Ette": lambda v: f"{int(v)} p",
-                        "ABC prognoos": "{:.1f}", "XL prognoos": "{:.1f}", "Kokku prognoos": "{:.1f}",
+                        "ABC prognoos": "{:.1f}", "C/B prognoos": lambda v: "—" if pd.isna(v) else f"{v:.2f}", "XL prognoos": "{:.1f}", "Kokku prognoos": "{:.1f}",
                         "ABC tegelik": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                        "C/B tegelik": lambda v: "—" if pd.isna(v) else f"{v:.2f}",
                         "XL tegelik": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
                         "Kokku tegelik": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
                         "Kogu viga": lambda v: "—" if pd.isna(v) else f"{v:+.1f}",
@@ -1445,28 +1640,116 @@ with tabs[3]:
                 st.caption("Esimesed prognoosisnapshot'id salvestatakse nüüd. Tegelike korjete lisandudes tekib siia võrdlus.")
 
         # -------------------------------------------------------------------------
-        # Jäljeotsija v2 — tulemuste läbipaistev kuvamine
+        # Jäljeotsija — uurimisraport päriselt tehtud testide põhjal
         # -------------------------------------------------------------------------
         if valid_pred.any():
-            st.markdown("##### Jäljeotsija v2")
+            st.markdown("##### Jäljeotsija — tänane uurimisraport")
             st.caption(
-                "Jäljeotsija hindab kõik kandidaadid sama ajaliselt ausa walk-forward skeemiga. "
-                "Championiks saab ainult operatiivselt 5 päeva ette arvutatav ja stabiilsuslävendi läbinud variant. "
-                "C/B katse jääb diagnostikaks, sest rekursiivses 5 päeva prognoosis ei ole tulevase eelkorje B/C jaotust veel teada."
+                "Kõik allolevad väited tulevad samast ajaliselt ausast walk-forward testist. "
+                "Jäljeotsija ei lisa tunnust mootorisse pelgalt hea ühe tulemuse pärast: kasu peab olema piisav ja ajaliselt stabiilne."
             )
+
             if not trace_df.empty:
-                show_trace = trace_df.copy()
-                st.dataframe(
-                    show_trace.style.format({
-                        "Baas MAE": "{:.2f}", "Katse MAE": "{:.2f}", "Paranemine": "{:+.2f}",
-                        "Võidab ridu %": "{:.0f}%", "Halvim pool": "{:+.2f}",
-                    }),
-                    use_container_width=True, hide_index=True,
-                )
-                st.caption(
-                    f"Aktiivne champion: {champion_name}. Valik arvutatakse uuesti iga uue korje järel; "
-                    "prognoosiajalukku salvestub ka championile vastav mudeliversioon."
-                )
+                # Inimloetavad hüpoteesid. Need ei ole järeldused, vaid kirjeldavad, mida test päriselt proovis.
+                trace_hypotheses = {
+                    "Eelmine A+B+C": "kas eelmise korje A+B+C annab ilma ja kasvudünaamika kõrval veel lisainfot",
+                    "A+B+C trend 2 korjet": "kas kahe viimase korje saagisuund annab järgmise korje kohta lisasignaali",
+                    "Korjejääk / kõrge eelkorje": "kas kõrge eelkorje koos XL-jäljega viitab vahele jäänud viljale või järelmõjule",
+                    "XL osakaal 2 korjet": "kas XL osakaalu mälu kannab järgmisse korjesse kasutatavat signaali",
+                    "Viimase 1 päeva ilm": "kas korje-eelse viimase päeva ilm on tähtsam kui kogu korjevahemiku keskmine",
+                    "Viimase 2 päeva ilm": "kas korje-eelse kahe päeva ilm annab eraldi lisasignaali",
+                    "Viimase 3 päeva ilm": "kas korje-eelse kolme päeva ilm annab eraldi lisasignaali",
+                    "C/B mälu 2 korjet (diagnostika)": "kas varasem suurusjaotus kannab järgmise korje A+B+C kohta diagnostilist infot",
+                }
+
+                def _why_not_stable(row):
+                    reasons = []
+                    if int(row.get("Testiridu", 0)) < 12:
+                        reasons.append("testiridu on veel vähe")
+                    if float(row.get("Paranemine", 0.0)) < 0.10:
+                        reasons.append("MAE paranemine on alla 0,10 kasti")
+                    if float(row.get("Võidab ridu %", 0.0)) < 50.0:
+                        reasons.append("ei võida vähemalt pooli testiridu")
+                    if float(row.get("Halvim pool", -999.0)) < -0.05:
+                        reasons.append("mõju ei püsi testi mõlemas ajapooles")
+                    return ", ".join(reasons) if reasons else "ei läbinud stabiilsusreeglit"
+
+                operational_trace = trace_df[trace_df["Jälg"].isin(operational_candidate_groups.keys())].copy()
+                operational_trace = operational_trace.sort_values("Paranemine", ascending=False)
+
+                st.markdown("**Mida ma täna kaalusin**")
+                considered = []
+                for _, r in operational_trace.iterrows():
+                    name = r["Jälg"]
+                    considered.append(f"**{name}** — {trace_hypotheses.get(name, 'lisatunnuse võimalik mõju')}")
+                if considered:
+                    st.markdown(";  ".join(considered) + ".")
+
+                st.markdown("**Praegu parim mootor**")
+                if champion_stats:
+                    st.success(
+                        f"**{champion_name}** on tänane champion. Samadel testiridadel on MAE "
+                        f"{champion_stats['Katse MAE']:.2f} kasti võrreldes baasi {champion_stats['Baas MAE']:.2f}-ga "
+                        f"(paranemine {champion_stats['Paranemine']:.2f}). See võitis "
+                        f"{champion_stats['Võidab ridu %']:.0f}% testiridadest ja mõju püsis ajaliselt piisavalt stabiilne."
+                    )
+                else:
+                    st.info(
+                        f"**{champion_name}** jääb championiks. Ükski lisajälg ei tõestanud täna piisavalt stabiilset eelist. "
+                        f"Weather-first baasi MAE on {champion_mae:.2f} kasti."
+                    )
+
+                # Lähim kandidaat = parima paranemisega operatiivne kandidaat, mis pole champion.
+                nearest = None
+                for _, r in operational_trace.iterrows():
+                    if r["Jälg"] != champion_name:
+                        nearest = r
+                        break
+                if nearest is not None:
+                    st.markdown("**Lähim kandidaat**")
+                    name = nearest["Jälg"]
+                    if bool(nearest["Stabiilne"]):
+                        status_text = "läbis stabiilsusreegli, kuid jäi tänasele championile alla"
+                    else:
+                        status_text = _why_not_stable(nearest)
+                    st.write(
+                        f"**{name}**: MAE {nearest['Katse MAE']:.2f} vs baas {nearest['Baas MAE']:.2f}; "
+                        f"muutus {nearest['Paranemine']:+.2f} kasti, võitis {nearest['Võidab ridu %']:.0f}% ridadest. "
+                        f"Praegu ei tõsta ma seda championiks, sest {status_text}."
+                    )
+
+                watch = operational_trace[(operational_trace["Paranemine"] > 0) & (~operational_trace["Stabiilne"])].head(3)
+                if not watch.empty:
+                    st.markdown("**Hoian silma peal**")
+                    for _, r in watch.iterrows():
+                        st.write(
+                            f"• **{r['Jälg']}** — praegu {r['Paranemine']:+.2f} kasti MAE muutus; "
+                            f"{_why_not_stable(r)}. Uute korjetega kontrollin seda uuesti."
+                        )
+
+                rejected = operational_trace[operational_trace["Paranemine"] <= 0].head(4)
+                if not rejected.empty:
+                    st.markdown("**Praegu kõrvale jäetud**")
+                    for _, r in rejected.iterrows():
+                        st.write(
+                            f"• **{r['Jälg']}** — ei parandanud tänases testis baasi "
+                            f"(MAE muutus {r['Paranemine']:+.2f} kasti). See ei tähenda, et seost kindlasti pole; "
+                            "praegused andmed ei toeta selle kasutamist championis."
+                        )
+
+                with st.expander("Näita Jäljeotsija kõiki teste ja numbreid"):
+                    show_trace = trace_df.copy()
+                    st.dataframe(
+                        show_trace.style.format({
+                            "Baas MAE": "{:.2f}", "Katse MAE": "{:.2f}", "Paranemine": "{:+.2f}",
+                            "Võidab ridu %": "{:.0f}%", "Halvim pool": "{:+.2f}",
+                        }),
+                        use_container_width=True, hide_index=True,
+                    )
+                    st.caption(
+                        f"Aktiivne champion: {champion_name}. Valik arvutatakse uuesti iga uue korje järel. "
+                        "Toortabel on alles kontrolliks; põhiinfo on ülal uurimisraportis."
+                    )
     else:
         st.info("Täieliku ilmavahemiku ja numbrilise saagiga õppimisridu ei ole veel piisavalt.")
 
@@ -1483,7 +1766,7 @@ with tabs[3]:
         )
 
     st.divider()
-    st.info("Mudel töötab kahekihiliselt: A+B+C champion-põhimudel + eraldi XL-komponent. Jäljeotsija valib jooksvalt stabiilseima operatiivse A+B+C variandi ja 5 päeva prognoos kasutab seda automaatselt.")
+    st.info("Mudel töötab kahekihiliselt: ilma- ja kasvudünaamikapõhine A+B+C champion-põhimudel + eraldi XL-komponent. Eelmine saak ei ole baasmudeli alus; Jäljeotsija võib saagimälu kasutada ainult siis, kui see läbib ausa stabiilsustesti.")
 
 with tabs[4]:
     st.subheader("Mootori tähelepanekud")

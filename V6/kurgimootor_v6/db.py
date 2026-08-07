@@ -202,6 +202,7 @@ def save_yield_forecasts(rows: List[Dict[str, Any]]) -> int:
             "field_no": int(row["field_no"]),
             "lead_days": int(row["lead_days"]),
             "abc_forecast": float(row["abc_forecast"]),
+            "cb_forecast": float(row["cb_forecast"]) if row.get("cb_forecast") is not None else None,
             "xl_forecast": float(row["xl_forecast"]),
             "total_forecast": float(row["total_forecast"]),
             "interval_days": int(row["interval_days"]) if row.get("interval_days") is not None else None,
@@ -211,24 +212,50 @@ def save_yield_forecasts(rows: List[Dict[str, Any]]) -> int:
             "generated_at": generated_at,
         }
         payloads.append(payload)
-    _execute(
-        _client().table("yield_forecasts").upsert(
-            payloads,
-            on_conflict="forecast_date,target_date,field_no,model_version",
+    try:
+        _execute(
+            _client().table("yield_forecasts").upsert(
+                payloads,
+                on_conflict="forecast_date,target_date,field_no,model_version",
+            )
         )
-    )
+    except DatabaseError as exc:
+        # Tagasiühilduvus: kui cb_forecast veergu pole veel migreeritud,
+        # salvesta ülejäänud prognoosid ikkagi. UI annab eraldi märku, et
+        # C/B ajalugu hakkab salvestuma pärast ALTER TABLE migratsiooni.
+        if "cb_forecast" not in str(exc).lower():
+            raise
+        fallback = [{k: v for k, v in row.items() if k != "cb_forecast"} for row in payloads]
+        _execute(
+            _client().table("yield_forecasts").upsert(
+                fallback,
+                on_conflict="forecast_date,target_date,field_no,model_version",
+            )
+        )
     return len(payloads)
 
 
 def get_yield_forecasts(limit: int = 1000) -> List[Dict[str, Any]]:
-    response = _execute(
-        _client().table("yield_forecasts")
-        .select("forecast_date,target_date,field_no,lead_days,abc_forecast,xl_forecast,total_forecast,interval_days,basis,estimated_weather_days,model_version,generated_at")
-        .order("target_date", desc=True)
-        .order("field_no")
-        .order("forecast_date", desc=True)
-        .limit(int(limit))
-    )
+    base = _client().table("yield_forecasts")
+    try:
+        response = _execute(
+            base.select("forecast_date,target_date,field_no,lead_days,abc_forecast,cb_forecast,xl_forecast,total_forecast,interval_days,basis,estimated_weather_days,model_version,generated_at")
+            .order("target_date", desc=True)
+            .order("field_no")
+            .order("forecast_date", desc=True)
+            .limit(int(limit))
+        )
+    except DatabaseError as exc:
+        if "cb_forecast" not in str(exc).lower():
+            raise
+        response = _execute(
+            _client().table("yield_forecasts")
+            .select("forecast_date,target_date,field_no,lead_days,abc_forecast,xl_forecast,total_forecast,interval_days,basis,estimated_weather_days,model_version,generated_at")
+            .order("target_date", desc=True)
+            .order("field_no")
+            .order("forecast_date", desc=True)
+            .limit(int(limit))
+        )
     return list(response.data or [])
 
 
