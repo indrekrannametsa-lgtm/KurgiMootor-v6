@@ -22,6 +22,50 @@ def _fmt(value: float, digits: int = 1) -> str:
     return f"{value:.{digits}f}".replace(".", ",")
 
 
+def _temperature_curve_features(tmins, tmaxs):
+    """Literature-informed, data-fitted nonlinear cucumber temperature basis.
+
+    Breakpoints encode only where physiology plausibly changes regime.
+    The coefficients/strength are learned from this farm's harvest data.
+
+    Night:
+      <16 C  : cold deficit + squared cold deficit (curvature; 12 can hurt far more than 14)
+      16-20 C: warm-night band
+      >20 C  : hot-night excess
+
+    Day:
+      <20 C  : cool-day deficit + squared deficit
+      20-28 C: productive warm band
+      >30 C  : heat excess + squared heat excess
+
+    Values are interval means so harvest interval length remains a separate feature.
+    """
+    tmins = np.asarray(list(tmins), dtype=float)
+    tmaxs = np.asarray(list(tmaxs), dtype=float)
+    if len(tmins) == 0 or len(tmaxs) == 0:
+        return {}
+
+    night_cold = np.maximum(0.0, 16.0 - tmins)
+    night_warm = np.clip(tmins - 16.0, 0.0, 4.0)
+    night_hot = np.maximum(0.0, tmins - 20.0)
+
+    day_cool = np.maximum(0.0, 20.0 - tmaxs)
+    day_warm = np.clip(tmaxs - 20.0, 0.0, 8.0)
+    day_hot = np.maximum(0.0, tmaxs - 30.0)
+
+    return {
+        "Öö jahedus <16": float(np.mean(night_cold)),
+        "Öö jahedus² <16": float(np.mean(night_cold ** 2)),
+        "Öö soojus 16-20": float(np.mean(night_warm)),
+        "Öö kuumus >20": float(np.mean(night_hot)),
+        "Päeva jahedus <20": float(np.mean(day_cool)),
+        "Päeva jahedus² <20": float(np.mean(day_cool ** 2)),
+        "Päeva soojus 20-28": float(np.mean(day_warm)),
+        "Päeva kuumus >30": float(np.mean(day_hot)),
+        "Päeva kuumus² >30": float(np.mean(day_hot ** 2)),
+    }
+
+
 
 
 def _format_field_value(value, digits=1):
@@ -733,7 +777,9 @@ with tabs[3]:
         if len(window_weather) != sample["weather_days"] or not window_weather:
             continue
 
-        daily_mean_t = [(_n(w.get("temp_min_c")) + _n(w.get("temp_max_c"))) / 2 for w in window_weather]
+        tmin = [_n(w.get("temp_min_c")) for w in window_weather]
+        tmax = [_n(w.get("temp_max_c")) for w in window_weather]
+        daily_mean_t = [(lo + hi) / 2 for lo, hi in zip(tmin, tmax)]
         rad = [_n(w.get("radiation_mj_m2")) for w in window_weather]
         rain = [_n(w.get("precipitation_mm")) for w in window_weather]
         hum = [_n(w.get("humidity_avg_pct")) for w in window_weather]
@@ -792,18 +838,40 @@ with tabs[3]:
 
         def _tail_weather(n):
             tail = window_weather[-min(n, len(window_weather)):]
-            mt = [(_n(w.get("temp_min_c")) + _n(w.get("temp_max_c"))) / 2 for w in tail]
+            tmins = [_n(w.get("temp_min_c")) for w in tail]
+            tmaxs = [_n(w.get("temp_max_c")) for w in tail]
+            mt = [(lo + hi) / 2 for lo, hi in zip(tmins, tmaxs)]
+            rad_sum = sum(_n(w.get("radiation_mj_m2")) for w in tail)
+            rain_sum = sum(_n(w.get("precipitation_mm")) for w in tail)
+            et0_sum = sum(_n(w.get("et0_mm")) for w in tail)
+            rh_mean = sum(_n(w.get("humidity_avg_pct")) for w in tail) / len(tail)
+            wind_mean = sum(_n(w.get("wind_avg_ms")) for w in tail) / len(tail)
+            tmax_mean = sum(tmaxs) / len(tmaxs)
+
             return {
                 f"T viim{n}": sum(mt) / len(mt),
-                f"Rad viim{n}": sum(_n(w.get("radiation_mj_m2")) for w in tail),
-                f"Sade viim{n}": sum(_n(w.get("precipitation_mm")) for w in tail),
-                f"ET0 viim{n}": sum(_n(w.get("et0_mm")) for w in tail),
-                f"Niiskus viim{n}": sum(_n(w.get("humidity_avg_pct")) for w in tail) / len(tail),
+                f"Tmin viim{n}": sum(tmins) / len(tmins),
+                f"Tmax viim{n}": tmax_mean,
+                f"Rad viim{n}": rad_sum,
+                f"Sade viim{n}": rain_sum,
+                f"ET0 viim{n}": et0_sum,
+                f"Niiskus viim{n}": rh_mean,
+                f"Tuul viim{n}": wind_mean,
+                f"Tuul×Tmax viim{n}": wind_mean * tmax_mean,
+                f"Tuul×Rad/p viim{n}": wind_mean * (rad_sum / len(tail)),
+                f"Tuul×ET0/p viim{n}": wind_mean * (et0_sum / len(tail)),
+                f"Tuul×Kuivus viim{n}": wind_mean * (100.0 - rh_mean),
+                f"Päevapikkus viim{n}": float(np.mean([
+                    _daylength_hours(sample["current_day"] - timedelta(days=i))
+                    for i in range(min(n, sample["interval_days"]))
+                ])) if sample["interval_days"] > 0 else _daylength_hours(sample["current_day"]),
             }
 
         tail1 = _tail_weather(1)
         tail2 = _tail_weather(2)
         tail3 = _tail_weather(3)
+
+        temp_curve = _temperature_curve_features(tmin, tmax)
 
         training_rows.append({
             "Kuupäev": sample["current_day"],
@@ -817,12 +885,39 @@ with tabs[3]:
             "XL -1": previous_xl,
             "XL -2": previous2_xl,
             "T kesk": sum(daily_mean_t) / len(daily_mean_t),
+            "Tmin kesk": sum(tmin) / len(tmin),
+            "Tmax kesk": sum(tmax) / len(tmax),
+            "Tmin min": min(tmin),
+            "Tmax max": max(tmax),
+            **temp_curve,
+            "Soojad ööd 16+": sum(1 for v in tmin if v >= 16.0),
+            "Soojad ööd 18+": sum(1 for v in tmin if v >= 18.0),
+            "Jahedad ööd 12-": sum(1 for v in tmin if v <= 12.0),
+            "Soojad ööd 16+ %": 100.0 * sum(1 for v in tmin if v >= 16.0) / len(tmin),
+            "Soojad ööd 18+ %": 100.0 * sum(1 for v in tmin if v >= 18.0) / len(tmin),
+            "Jahedad ööd 12- %": 100.0 * sum(1 for v in tmin if v <= 12.0) / len(tmin),
             "Radiatsioon Σ": sum(rad),
             "Radiatsioon/p": sum(rad) / len(rad),
             "Sademed Σ": sum(rain),
             "Niiskus kesk": sum(hum) / len(hum),
             "ET0 Σ": sum(et0),
             "Tuul kesk": sum(wind) / len(wind),
+
+            # Tuule koostoimed. Need EI lähe automaatselt baasmudelisse,
+            # vaid Jäljeotsija testib neid walk-forward meetodil.
+            "Tuul×Tmax": (sum(wind) / len(wind)) * (sum(tmax) / len(tmax)),
+            "Tuul×Rad/p": (sum(wind) / len(wind)) * (sum(rad) / len(rad)),
+            "Tuul×ET0/p": (sum(wind) / len(wind)) * (sum(et0) / len(et0)),
+            "Tuul×Kuivus": (sum(wind) / len(wind)) * (100.0 - (sum(hum) / len(hum))),
+
+            # Fotoperiood / päevapikkus.
+            "Päevapikkus": _daylength_hours(sample["current_day"]),
+            "Päevapikkus Δ7p": _daylength_change_7d(sample["current_day"]),
+            "Päevapikkus kasvukesk": float(np.mean([
+                _daylength_hours(sample["previous_day"] + timedelta(days=i))
+                for i in range(1, sample["interval_days"] + 1)
+            ])) if sample["interval_days"] > 0 else _daylength_hours(sample["current_day"]),
+
             "A": current_row.get("a"),
             "B": current_row.get("b"),
             "C": current_row.get("c"),
@@ -853,7 +948,7 @@ with tabs[3]:
 
         visible_training_cols = [
             "Kuupäev", "Põld", "Intervall p", "ABC saak", "C/B siht", "XL", "Saak", "Eelmine ABC",
-            "T kesk", "Radiatsioon Σ", "Radiatsioon/p", "Sademed Σ",
+            "T kesk", "Tmin kesk", "Tmax kesk", "Tmin min", "Tmax max", "Radiatsioon Σ", "Radiatsioon/p", "Sademed Σ",
             "Niiskus kesk", "ET0 Σ", "Tuul kesk", "A", "B", "C", "Andmekvaliteet",
         ]
         display_df = training_df[visible_training_cols].copy()
@@ -865,6 +960,10 @@ with tabs[3]:
                 "Saak": "{:.1f}",
                 "Eelmine ABC": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
                 "T kesk": "{:.1f}",
+                "Tmin kesk": "{:.1f}",
+                "Tmax kesk": "{:.1f}",
+                "Tmin min": "{:.1f}",
+                "Tmax max": "{:.1f}",
                 "Radiatsioon Σ": "{:.1f}",
                 "Radiatsioon/p": "{:.1f}",
                 "Sademed Σ": "{:.1f}",
@@ -896,16 +995,50 @@ with tabs[3]:
 
         st.markdown("##### A+B+C kasvupotentsiaali mudel + eraldi XL-komponent")
         st.caption(
+            "Temperatuurivastus on mittelineaarne: külma- ja kuumastressil on eraldi tsoonid ning ruutliikmed. "
+            "Seetõttu ei käsitle mootor näiteks 12→14 °C ja 16→18 °C öist muutust võrdse mõjuna. "
+            "Murdepunktid on bioloogiliselt informeeritud; mõju tugevuse õpib mudel meie enda korjetest."
+        )
+        st.caption(
             "Põhimudel ennustab ainult A+B+C saaki positiivsel kasvupotentsiaali skaalal. "
-            "Baasmudel kasutab ilma, korjeintervalli, hooaja faasi ja põllu identiteeti; eelmine saak ei ole prognoosi ankur. "
+            "Baasmudel kasutab Tmin/Tmax mittelineaarset kasvukõverat, muud ilma, korjeintervalli, hooaja faasi ja põllu identiteeti; eelmine saak ei ole prognoosi ankur. "
             "XL prognoositakse eraldi mürasema korjejäägi komponendina. Mõlemat hinnatakse ajaliselt ausa walk-forward testiga."
         )
+
+        # Astronoomiline päevapikkus Pärnu piirkonna laiuskraadil.
+        # Longitude pole päevapikkuse kestuse jaoks vajalik; kasutame geograafilist laiust ~58.38 N.
+        DAYLENGTH_LAT = 58.38
+
+        def _daylength_hours(day_value):
+            n = int(day_value.timetuple().tm_yday)
+            lat = math.radians(DAYLENGTH_LAT)
+            # NOAA-tüüpi lihtsustatud päikesedeklinatsioon; piisav fotoperioodi tunnuseks.
+            decl = math.radians(23.44) * math.sin(2.0 * math.pi * (284 + n) / 365.0)
+            cos_omega = -math.tan(lat) * math.tan(decl)
+            cos_omega = max(-1.0, min(1.0, cos_omega))
+            omega = math.acos(cos_omega)
+            return 24.0 * omega / math.pi
+
+        def _daylength_change_7d(day_value):
+            return _daylength_hours(day_value) - _daylength_hours(day_value - timedelta(days=7))
 
         # Baasmudel on teadlikult puhas bioloogiline mudel: ilm + kasvuaeg + põld + hooaja faas.
         # Eelmise korje saak EI ole baasmudeli kohustuslik sisend; Jäljeotsija võib selle
         # eraldi kandidaadina sisse lubada ainult siis, kui aus walk-forward test tõestab kasu.
         base_cont_cols = [
-            "Intervall p", "Hooajapäev", "T kesk", "Radiatsioon Σ", "Radiatsioon/p",
+            "Intervall p", "Hooajapäev",
+
+            # V6.4 nonlinear-temperature:
+            # temperatuur EI sisene enam ühe lineaarse Tmin/Tmax koefitsiendina.
+            # Külmastressi ruutliige võimaldab nt 12 C ööl olla ebaproportsionaalselt
+            # halvem kui 14 C, samal ajal kui 16 -> 18 ei pea andma sama suurt võitu.
+            "Öö jahedus <16", "Öö jahedus² <16",
+            "Öö soojus 16-20", "Öö kuumus >20",
+            "Päeva jahedus <20", "Päeva jahedus² <20",
+            "Päeva soojus 20-28",
+            "Päeva kuumus >30", "Päeva kuumus² >30",
+
+            "Radiatsioon Σ", "Radiatsioon/p",
             "Sademed Σ", "Niiskus kesk", "ET0 Σ", "Tuul kesk",
         ]
         model_df = training_df.copy().sort_values(["Kuupäev", "Põld"]).reset_index(drop=True)
@@ -1116,9 +1249,38 @@ with tabs[3]:
         # jäljed, kui need läbivad sama range walk-forward stabiilsustesti. Toores eelmine
         # saak/trend/XL/C-B ei saa prognoosi ankurdada ja jäävad diagnostikasse.
         weather_candidate_groups = {
-            "Viimase 1 päeva ilm": ["T viim1", "Rad viim1", "Sade viim1", "ET0 viim1", "Niiskus viim1"],
-            "Viimase 2 päeva ilm": ["T viim2", "Rad viim2", "Sade viim2", "ET0 viim2", "Niiskus viim2"],
-            "Viimase 3 päeva ilm": ["T viim3", "Rad viim3", "Sade viim3", "ET0 viim3", "Niiskus viim3"],
+            "Viimase 1 päeva ilm": ["Tmin viim1", "Tmax viim1", "Rad viim1", "Sade viim1", "ET0 viim1", "Niiskus viim1"],
+            "Viimase 2 päeva ilm": ["Tmin viim2", "Tmax viim2", "Rad viim2", "Sade viim2", "ET0 viim2", "Niiskus viim2"],
+            "Viimase 3 päeva ilm": ["Tmin viim3", "Tmax viim3", "Rad viim3", "Sade viim3", "ET0 viim3", "Niiskus viim3"],
+
+            # Ööd / temperatuur
+            "Soojad ööd 16+": ["Soojad ööd 16+ %"],
+            "Väga soojad ööd 18+": ["Soojad ööd 18+ %"],
+            "Jahedad ööd 12-": ["Jahedad ööd 12- %"],
+            "Öötemperatuuri kuju": ["Tmin min", "Soojad ööd 16+ %", "Jahedad ööd 12- %"],
+            "Päev/öö äärmused": ["Tmin min", "Tmax max"],
+
+            # Kontrollkatse: kas toore lineaarse Tmin/Tmax lisamine annab pärast
+            # mittelineaarset baasi veel päriselt midagi juurde?
+            "Lineaarne Tmin/Tmax lisaks": ["Tmin kesk", "Tmax kesk"],
+
+            # Tuule koostoimed
+            "Tuul × Tmax": ["Tuul×Tmax"],
+            "Tuul × radiatsioon": ["Tuul×Rad/p"],
+            "Tuul × ET0": ["Tuul×ET0/p"],
+            "Tuul × kuivus": ["Tuul×Kuivus"],
+            "Tuulestress kombineeritud": ["Tuul×Tmax", "Tuul×Rad/p", "Tuul×ET0/p", "Tuul×Kuivus"],
+
+            # Viimase 1–3 päeva tuulestress
+            "Tuulestress viim1": ["Tuul×Tmax viim1", "Tuul×Rad/p viim1", "Tuul×ET0/p viim1", "Tuul×Kuivus viim1"],
+            "Tuulestress viim2": ["Tuul×Tmax viim2", "Tuul×Rad/p viim2", "Tuul×ET0/p viim2", "Tuul×Kuivus viim2"],
+            "Tuulestress viim3": ["Tuul×Tmax viim3", "Tuul×Rad/p viim3", "Tuul×ET0/p viim3", "Tuul×Kuivus viim3"],
+
+            # Fotoperiood
+            "Päevapikkus": ["Päevapikkus"],
+            "Päevapikkuse trend": ["Päevapikkus", "Päevapikkus Δ7p"],
+            "Kasvuperioodi päevapikkus": ["Päevapikkus kasvukesk"],
+            "Päevapikkus viim3": ["Päevapikkus viim3", "Päevapikkus Δ7p"],
         }
         biological_load_candidate_groups = {
             "Ebatavaline koormus -1": ["Koormusindeks -1", "Ülekoormus -1"],
@@ -1438,7 +1600,8 @@ with tabs[3]:
             n_extra = len(extra_values)
             groups = {
                 "Temperatuur": 0.0, "Radiatsioon": 0.0, "Sademed": 0.0,
-                "Niiskus": 0.0, "ET0": 0.0, "Tuul": 0.0,
+                "Niiskus": 0.0, "ET0": 0.0, "Tuul": 0.0, "Tuul+stress": 0.0,
+                "Päevapikkus": 0.0,
                 "Intervall": 0.0, "Hooaeg": 0.0, "Põlluefekt": 0.0,
                 "Biokoormus": 0.0, "Muu": 0.0,
             }
@@ -1448,7 +1611,10 @@ with tabs[3]:
                     return "Intervall"
                 if name == "Hooajapäev":
                     return "Hooaeg"
-                if name == "T kesk" or str(name).startswith("T viim"):
+                if (
+                    name in {"T kesk", "Tmin kesk", "Tmax kesk", "Tmin min", "Tmax max"}
+                    or str(name).startswith(("T viim", "Tmin viim", "Tmax viim", "Öö ", "Päeva "))
+                ):
                     return "Temperatuur"
                 if str(name).startswith("Radiatsioon") or str(name).startswith("Rad viim"):
                     return "Radiatsioon"
@@ -1458,6 +1624,10 @@ with tabs[3]:
                     return "Niiskus"
                 if str(name).startswith("ET0"):
                     return "ET0"
+                if str(name).startswith("Päevapikkus"):
+                    return "Päevapikkus"
+                if str(name).startswith("Tuul×"):
+                    return "Tuul+stress"
                 if str(name).startswith("Tuul"):
                     return "Tuul"
                 if name in {"Koormusindeks -1", "Ülekoormus -1", "2 korje koormus", "Tipukorje -1", "Tipukorje -2"}:
@@ -1578,26 +1748,66 @@ with tabs[3]:
                 d += timedelta(days=1)
             if not rows:
                 return None, None
-            mean_t = [(r["temp_min_c"] + r["temp_max_c"]) / 2 for r in rows]
+            tmins_all = [r["temp_min_c"] for r in rows]
+            tmaxs_all = [r["temp_max_c"] for r in rows]
+            mean_t = [(lo + hi) / 2 for lo, hi in zip(tmins_all, tmaxs_all)]
             wx = {
                 "Intervall p": (target_day - previous_day).days,
                 "Hooajapäev": (target_day - date(2026, 7, 1)).days,
                 "T kesk": float(np.mean(mean_t)),
+                "Tmin kesk": float(np.mean(tmins_all)),
+                "Tmax kesk": float(np.mean(tmaxs_all)),
+                "Tmin min": float(np.min(tmins_all)),
+                "Tmax max": float(np.max(tmaxs_all)),
+                "Soojad ööd 16+": int(sum(1 for v in tmins_all if v >= 16.0)),
+                "Soojad ööd 18+": int(sum(1 for v in tmins_all if v >= 18.0)),
+                "Jahedad ööd 12-": int(sum(1 for v in tmins_all if v <= 12.0)),
+                "Soojad ööd 16+ %": 100.0 * sum(1 for v in tmins_all if v >= 16.0) / len(tmins_all),
+                "Soojad ööd 18+ %": 100.0 * sum(1 for v in tmins_all if v >= 18.0) / len(tmins_all),
+                "Jahedad ööd 12- %": 100.0 * sum(1 for v in tmins_all if v <= 12.0) / len(tmins_all),
                 "Radiatsioon Σ": float(np.sum([r["radiation_mj_m2"] for r in rows])),
                 "Radiatsioon/p": float(np.mean([r["radiation_mj_m2"] for r in rows])),
                 "Sademed Σ": float(np.sum([r["precipitation_mm"] for r in rows])),
                 "Niiskus kesk": float(np.mean([r["humidity_avg_pct"] for r in rows])),
                 "ET0 Σ": float(np.sum([r["et0_mm"] for r in rows])),
                 "Tuul kesk": float(np.mean([r["wind_avg_ms"] for r in rows])),
+                "Päevapikkus": _daylength_hours(target_day),
+                "Päevapikkus Δ7p": _daylength_change_7d(target_day),
+                "Päevapikkus kasvukesk": float(np.mean([
+                    _daylength_hours(previous_day + timedelta(days=i))
+                    for i in range(1, (target_day - previous_day).days + 1)
+                ])) if (target_day - previous_day).days > 0 else _daylength_hours(target_day),
             }
+
+            # Sama tuule koostoime arvutus peab olema õppimisel ja prognoosis identne.
+            # Täpselt sama mittelineaarne temperatuuribaas nagu õppimisandmestikus.
+            wx.update(_temperature_curve_features(tmins_all, tmaxs_all))
+
+            wx["Tuul×Tmax"] = wx["Tuul kesk"] * wx["Tmax kesk"]
+            wx["Tuul×Rad/p"] = wx["Tuul kesk"] * wx["Radiatsioon/p"]
+            wx["Tuul×ET0/p"] = wx["Tuul kesk"] * (wx["ET0 Σ"] / max(1, len(rows)))
+            wx["Tuul×Kuivus"] = wx["Tuul kesk"] * (100.0 - wx["Niiskus kesk"])
             for n in (1, 2, 3):
                 tail = rows[-min(n, len(rows)):]
-                tvals = [(r["temp_min_c"] + r["temp_max_c"]) / 2 for r in tail]
+                tmins = [r["temp_min_c"] for r in tail]
+                tmaxs = [r["temp_max_c"] for r in tail]
+                tvals = [(lo + hi) / 2 for lo, hi in zip(tmins, tmaxs)]
                 wx[f"T viim{n}"] = float(np.mean(tvals))
+                wx[f"Tmin viim{n}"] = float(np.mean(tmins))
+                wx[f"Tmax viim{n}"] = float(np.mean(tmaxs))
                 wx[f"Rad viim{n}"] = float(np.sum([r["radiation_mj_m2"] for r in tail]))
                 wx[f"Sade viim{n}"] = float(np.sum([r["precipitation_mm"] for r in tail]))
                 wx[f"ET0 viim{n}"] = float(np.sum([r["et0_mm"] for r in tail]))
                 wx[f"Niiskus viim{n}"] = float(np.mean([r["humidity_avg_pct"] for r in tail]))
+                wx[f"Tuul viim{n}"] = float(np.mean([r["wind_avg_ms"] for r in tail]))
+                wx[f"Tuul×Tmax viim{n}"] = wx[f"Tuul viim{n}"] * wx[f"Tmax viim{n}"]
+                wx[f"Tuul×Rad/p viim{n}"] = wx[f"Tuul viim{n}"] * (wx[f"Rad viim{n}"] / len(tail))
+                wx[f"Tuul×ET0/p viim{n}"] = wx[f"Tuul viim{n}"] * (wx[f"ET0 viim{n}"] / len(tail))
+                wx[f"Tuul×Kuivus viim{n}"] = wx[f"Tuul viim{n}"] * (100.0 - wx[f"Niiskus viim{n}"])
+                wx[f"Päevapikkus viim{n}"] = float(np.mean([
+                    _daylength_hours(target_day - timedelta(days=i))
+                    for i in range(min(n, len(rows)))
+                ]))
             return wx, estimated_days
 
         def _champion_feature_values(state, wx):
@@ -1619,7 +1829,19 @@ with tabs[3]:
                 "Tipukorje -2": state.get("peak_prev"),
             }
             for k, v in wx.items():
-                if k.startswith(("T viim", "Rad viim", "Sade viim", "ET0 viim", "Niiskus viim")):
+                if (
+                    k.startswith((
+                        "T viim", "Tmin viim", "Tmax viim", "Rad viim", "Sade viim",
+                        "ET0 viim", "Niiskus viim", "Tuul viim", "Tuul×"
+                    ))
+                    or k in {
+                        "Tmin min", "Tmax max", "Soojad ööd 16+ %",
+                        "Soojad ööd 18+ %", "Jahedad ööd 12- %",
+                        "Tuul×Tmax", "Tuul×Rad/p", "Tuul×ET0/p", "Tuul×Kuivus",
+                        "Päevapikkus", "Päevapikkus Δ7p", "Päevapikkus kasvukesk"
+                    }
+                    or k.startswith("Päevapikkus viim")
+                ):
                     values[k] = v
             return [values.get(c) for c in champion_cols]
 
@@ -1634,7 +1856,19 @@ with tabs[3]:
                 "XL osakaal -2": (state.get("xl_prev") / state.get("total_prev")) if state.get("xl_prev") is not None and state.get("total_prev") not in (None, 0) else None,
             }
             for k, v in wx.items():
-                if k.startswith(("T viim", "Rad viim", "Sade viim", "ET0 viim", "Niiskus viim")):
+                if (
+                    k.startswith((
+                        "T viim", "Tmin viim", "Tmax viim", "Rad viim", "Sade viim",
+                        "ET0 viim", "Niiskus viim", "Tuul viim", "Tuul×"
+                    ))
+                    or k in {
+                        "Tmin min", "Tmax max", "Soojad ööd 16+ %",
+                        "Soojad ööd 18+ %", "Jahedad ööd 12- %",
+                        "Tuul×Tmax", "Tuul×Rad/p", "Tuul×ET0/p", "Tuul×Kuivus",
+                        "Päevapikkus", "Päevapikkus Δ7p", "Päevapikkus kasvukesk"
+                    }
+                    or k.startswith("Päevapikkus viim")
+                ):
                     values[k] = v
             return [values.get(c) for c in cb_champion_cols]
 
@@ -1814,7 +2048,7 @@ with tabs[3]:
         # Mudeliversioon tähistab champion-valiku raamistikku, mitte tänase võitja nime.
         # Nii uuendab sama päeva rerun sama operatiivset snapshot'i ka siis, kui champion
         # uue korje järel päeva jooksul muutub. Võitja nimi salvestub basis-väljale.
-        MODEL_VERSION = "v6.4-growth-potential-explain-v1"
+        MODEL_VERSION = "v6.4-growth-nonlinear-temp-nights-wind-daylength-v5"
         forecast_payloads = []
         for target_day, rows_day in forecast_days:
             for row in rows_day:
@@ -1907,7 +2141,10 @@ with tabs[3]:
                 explain_rows.append(erow)
                 try:
                     input_lines.append(
-                        f"põld {int(r.get('Põld'))}: T {float(wxr.get('T kesk')):.1f} °C · "
+                        f"põld {int(r.get('Põld'))}: Tmin {float(wxr.get('Tmin kesk')):.1f} °C (min {float(wxr.get('Tmin min')):.1f}) · "
+                        f"Tmax {float(wxr.get('Tmax kesk')):.1f} °C (max {float(wxr.get('Tmax max')):.1f}) · "
+                        f"sooje öid ≥16 °C {int(wxr.get('Soojad ööd 16+'))}/{int(wxr.get('Intervall p'))} · "
+                        f"päev {float(wxr.get('Päevapikkus')):.2f} h ({float(wxr.get('Päevapikkus Δ7p')):+.2f} h/7p) · "
                         f"rad {float(wxr.get('Radiatsioon Σ')):.1f} MJ/m² ({float(wxr.get('Radiatsioon/p')):.1f}/p) · "
                         f"sade {float(wxr.get('Sademed Σ')):.1f} mm · RH {float(wxr.get('Niiskus kesk')):.0f}% · "
                         f"ET0 {float(wxr.get('ET0 Σ')):.1f} mm · intervall {int(wxr.get('Intervall p'))} p"
