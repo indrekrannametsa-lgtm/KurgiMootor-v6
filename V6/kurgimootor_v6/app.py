@@ -766,7 +766,7 @@ with tabs[3]:
         visible_training_cols = [
             "Kuupäev", "Põld", "Intervall p", "ABC saak", "XL", "Saak", "Eelmine ABC",
             "T kesk", "Radiatsioon Σ", "Radiatsioon/p", "Sademed Σ",
-            "Niiskus kesk", "ET0 Σ", "Tuul kesk", "A", "B", "C", "XL", "Andmekvaliteet",
+            "Niiskus kesk", "ET0 Σ", "Tuul kesk", "A", "B", "C", "Andmekvaliteet",
         ]
         display_df = training_df[visible_training_cols].copy()
         display_df["Kuupäev"] = display_df["Kuupäev"].map(lambda d: d.strftime("%d.%m"))
@@ -775,8 +775,6 @@ with tabs[3]:
                 "ABC saak": "{:.1f}",
                 "Saak": "{:.1f}",
                 "Eelmine ABC": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
-                "XL -1": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
-                "XL -2": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
                 "T kesk": "{:.1f}",
                 "Radiatsioon Σ": "{:.1f}",
                 "Radiatsioon/p": "{:.1f}",
