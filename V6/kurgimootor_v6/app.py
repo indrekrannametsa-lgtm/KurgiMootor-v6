@@ -208,11 +208,36 @@ with tabs[1]:
     st.subheader("Korjed")
     st.caption("Andmebaasis hoitakse iga põllu korje eraldi. Äpis vaatame saaki eelkõige päevade kaupa.")
 
-    # Järgmise korje vaikimisi valikud. Pärast salvestust liiguvad need automaatselt edasi.
-    # form_version annab pärast salvestust vormiväljadele uued võtmed, et Streamlit
-    # võtaks päriselt kasutusele uued vaikimisi väärtused.
-    default_field = int(st.session_state.get("next_harvest_field", 1))
-    default_order = int(st.session_state.get("next_harvest_order", 1))
+    # Järgmise korje vaikimisi valikud tuletatakse esmalt päris tänastest andmetest.
+    # Nii avaneb äpp pärast refreshi/redeploy'd kohe järgmise puuduva põllu ja järjekorraga,
+    # mitte ei kuku tagasi 1 / 1 peale. Session state jääb siiski sama sessiooni jooksul
+    # pärast salvestust esmaseks, et järgmisele reale liikumine oleks kohene.
+    today_rows_for_form = db.get_harvest_for_day(TODAY)
+    history_for_form = db.get_harvest_history()
+    planned_for_form = _planned_fields_for_day(TODAY, today_rows_for_form, history_for_form)
+
+    used_orders = {
+        int(r.get("harvest_order"))
+        for r in today_rows_for_form
+        if r.get("harvest_order") is not None and int(r.get("harvest_order")) in (1, 2, 3)
+    }
+    missing_orders = [order for order in (1, 2, 3) if order not in used_orders]
+
+    if missing_orders:
+        inferred_order = missing_orders[0]
+        inferred_field = int(planned_for_form[inferred_order - 1])
+    elif today_rows_for_form:
+        # Päev on 3/3 valmis. Kui kasutaja siiski lisab/parandab uut rida,
+        # alustame järgmisest põllust ja järjekorrast 1.
+        ordered_complete = sorted(today_rows_for_form, key=lambda r: int(r.get("harvest_order") or 99))
+        inferred_field = _next_field(int(ordered_complete[-1].get("field_no")))
+        inferred_order = 1
+    else:
+        inferred_field = int(planned_for_form[0])
+        inferred_order = 1
+
+    default_field = int(st.session_state.get("next_harvest_field", inferred_field))
+    default_order = int(st.session_state.get("next_harvest_order", inferred_order))
     form_version = int(st.session_state.get("harvest_form_version", 0))
 
     st.markdown("#### Lisa või paranda korje")
@@ -640,6 +665,43 @@ with tabs[3]:
         "eelmise ja järgmise korje vahele jäävatest mõõdetud päevadest. A+B+C põhimudeli siht on tegelik A+B+C; XL hinnatakse eraldi."
     )
 
+    # Bioloogilise koormuse jäljed arvutatakse ainult varasematest päriselt mõõdetud
+    # sama põllu korjetest. Toorest eelmist saaki ei kasutata ankru ega prognoosi alusena.
+    # Koormusindeks küsib: kas konkreetne korje oli selle põllu enda varasema tasemega
+    # võrreldes ebatavaliselt suur, ning kas sellel on 1–2 korje järel stabiilne mõju.
+    load_state_by_field_date = {}
+    for _field_no, _rows in rows_by_field.items():
+        _abc_hist = []
+        _peak_hist = []
+        for _row in sorted(_rows, key=lambda r: str(r.get("harvest_date") or "")):
+            try:
+                _d = date.fromisoformat(str(_row.get("harvest_date")))
+                _a = float(_row.get("a")); _b = float(_row.get("b")); _c = float(_row.get("c"))
+            except (TypeError, ValueError):
+                continue
+            _quality = str(_row.get("data_quality") or "").strip().lower()
+            if _quality in {"hinnanguline", "ligikaudne"}:
+                continue
+            _abc = _a + _b + _c
+            _prior = _abc_hist[-3:]
+            _baseline = float(np.mean(_prior)) if _prior else None
+            _load_index = (_abc / _baseline) if (_baseline is not None and _baseline > 0) else None
+            _overload = max(0.0, _load_index - 1.0) if _load_index is not None else None
+            _two_load = None
+            if _prior:
+                _two_mean = float(np.mean([_abc, _prior[-1]]))
+                _two_load = (_two_mean / _baseline) if _baseline > 0 else None
+            _peak = 1.0 if (_load_index is not None and _load_index >= 1.25) else 0.0 if _load_index is not None else None
+            load_state_by_field_date[(int(_field_no), _d)] = {
+                "Koormusindeks -1": _load_index,
+                "Ülekoormus -1": _overload,
+                "2 korje koormus": _two_load,
+                "Tipukorje -1": _peak,
+                "Tipukorje -2": _peak_hist[-1] if _peak_hist else None,
+            }
+            _abc_hist.append(_abc)
+            _peak_hist.append(_peak)
+
     training_rows = []
     for sample in usable_samples:
         current_row = sample.get("current_row") or {}
@@ -725,6 +787,7 @@ with tabs[3]:
         previous_cb = None if prev_quality == "hinnanguline" else ((previous_c / previous_b) if (previous_c is not None and previous_b and previous_b > 0) else None)
         previous2_cb = None if prev2_quality == "hinnanguline" else ((previous2_c / previous2_b) if (previous2_c is not None and previous2_b and previous2_b > 0) else None)
         yield_trend = (previous_abc - previous2_abc) if (previous_abc is not None and previous2_abc is not None) else None
+        prev_load = load_state_by_field_date.get((int(sample["field_no"]), sample["previous_day"]), {})
 
         def _tail_weather(n):
             tail = window_weather[-min(n, len(window_weather)):]
@@ -771,6 +834,11 @@ with tabs[3]:
             "XL osakaal -2": previous2_xl_share,
             "C/B -1": previous_cb,
             "C/B -2": previous2_cb,
+            "Koormusindeks -1": prev_load.get("Koormusindeks -1"),
+            "Ülekoormus -1": prev_load.get("Ülekoormus -1"),
+            "2 korje koormus": prev_load.get("2 korje koormus"),
+            "Tipukorje -1": prev_load.get("Tipukorje -1"),
+            "Tipukorje -2": prev_load.get("Tipukorje -2"),
             **tail1, **tail2, **tail3,
             "Andmekvaliteet": current_row.get("data_quality") or "",
         })
@@ -1005,17 +1073,30 @@ with tabs[3]:
         # -------------------------------------------------------------------------
         # Jäljeotsija v2 — automaatne champion-valik A+B+C põhimudelile
         # -------------------------------------------------------------------------
-        operational_candidate_groups = {
-            # Saagimälu ei ole enam baasi osa. Need read on teadlikult eraldi kandidaadid.
-            "Eelmine A+B+C": ["Eelmine ABC"],
-            "A+B+C trend 2 korjet": ["Eelmine ABC", "Eelmine2 ABC", "ABC trend"],
-            "Korjejääk / kõrge eelkorje": ["Eelmine saak", "XL -1", "XL -2", "XL osakaal -1", "XL osakaal -2"],
-            "XL osakaal 2 korjet": ["XL osakaal -1", "XL osakaal -2"],
+        # WEATHER-FIRST + BIOLOOGILISE KOORMUSE LUKK:
+        # A+B+C baas jääb ilm + intervall + hooaja faas + põld. Operatiivseks korrigeerijaks
+        # võivad saada kas ilmast tuletatud jäljed või normaliseeritud bioloogilise koormuse
+        # jäljed, kui need läbivad sama range walk-forward stabiilsustesti. Toores eelmine
+        # saak/trend/XL/C-B ei saa prognoosi ankurdada ja jäävad diagnostikasse.
+        weather_candidate_groups = {
             "Viimase 1 päeva ilm": ["T viim1", "Rad viim1", "Sade viim1", "ET0 viim1", "Niiskus viim1"],
             "Viimase 2 päeva ilm": ["T viim2", "Rad viim2", "Sade viim2", "ET0 viim2", "Niiskus viim2"],
             "Viimase 3 päeva ilm": ["T viim3", "Rad viim3", "Sade viim3", "ET0 viim3", "Niiskus viim3"],
         }
+        biological_load_candidate_groups = {
+            "Ebatavaline koormus -1": ["Koormusindeks -1", "Ülekoormus -1"],
+            "Kahe korje koormus": ["2 korje koormus"],
+            "Tipukorje järelmõju": ["Tipukorje -1", "Tipukorje -2"],
+        }
+        operational_candidate_groups = {**weather_candidate_groups, **biological_load_candidate_groups}
+        memory_diagnostic_groups = {
+            "Eelmine A+B+C": ["Eelmine ABC"],
+            "A+B+C trend 2 korjet": ["Eelmine ABC", "Eelmine2 ABC", "ABC trend"],
+            "Korjejääk / kõrge eelkorje": ["Eelmine saak", "XL -1", "XL -2", "XL osakaal -1", "XL osakaal -2"],
+            "XL osakaal 2 korjet": ["XL osakaal -1", "XL osakaal -2"],
+        }
         diagnostic_only_groups = {
+            **memory_diagnostic_groups,
             "C/B mälu 2 korjet (diagnostika)": ["C/B -1", "C/B -2"],
         }
 
@@ -1109,9 +1190,9 @@ with tabs[3]:
         else:
             ch3.metric("Eelis baasi ees", "0.00 kasti")
             st.info(
-                "Ükski lisatunnuste grupp ei läbinud täna stabiilsuslävendit. "
+                "Ükski ilmast ega bioloogilisest koormusest tuletatud lisajälg ei läbinud täna stabiilsuslävendit. "
                 "9 päeva prognoos kasutab seetõttu puhast ilma + intervalli + hooaja faasi + põllu baasmudelit. "
-                "Eelmist saaki ei kasutata — see on teadlik turvapiirang, mitte veaolukord."
+                "Toorest eelmist saaki, saagitrendi, XL-i ega C/B-d Jäljeotsija prognoosi ankruks ei luba."
             )
 
         # -------------------------------------------------------------------------
@@ -1250,7 +1331,12 @@ with tabs[3]:
         champion_extra_arrays = [
             pd.to_numeric(model_df[c], errors="coerce").to_numpy(dtype=float) for c in champion_cols
         ]
+        full_abc_base_model = _fit_full_generic(y_abc, [])
         full_abc_model = _fit_full_generic(y_abc, champion_extra_arrays)
+        biological_load_feature_names = {
+            c for cols in biological_load_candidate_groups.values() for c in cols
+        }
+        champion_uses_biological_load = any(c in biological_load_feature_names for c in champion_cols)
         full_xl_model = _fit_full_generic(y_xl, [raw_xl1, raw_xl2, raw_prev_abc, raw_prev_total])
         cb_champion_extra_arrays = [
             pd.to_numeric(model_df[c], errors="coerce").to_numpy(dtype=float) for c in cb_champion_cols
@@ -1263,7 +1349,8 @@ with tabs[3]:
         st.markdown("##### 9 päeva saagiprognoos")
         st.caption(
             f"A+B+C kasutab tänast champion-mootorit: {champion_name}. Baasmudel põhineb ilmal, intervallil, "
-            f"hooaja faasil ja põllu identiteedil — eelmine saak ei ole kohustuslik sisend. "
+            f"hooaja faasil ja põllu identiteedil. Tõestatud normaliseeritud bioloogiline koormus võib baasi korrigeerida, "
+            f"kuid toores eelmine saak, saagitrend ja muud korjeajaloo mälutunnused ei saa prognoosi ankurdada. "
             f"C/B kasutab eraldi championit: {cb_champion_name}. XL lisatakse eraldi korjejäägi komponendina. "
             "Korjevahemiku möödunud päevadel kasutatakse mõõdetud ilma ja tulevastel päevadel 9 päeva ilmaprognoosi."
         )
@@ -1344,6 +1431,8 @@ with tabs[3]:
 
         def _champion_feature_values(state, wx):
             values = {
+                # Toored saagimälu väärtused on siin ainult diagnostika ühilduvuse jaoks;
+                # operatiivse championi nimekiri neid ei sisalda.
                 "Eelmine ABC": state.get("abc"),
                 "Eelmine2 ABC": state.get("abc_prev"),
                 "ABC trend": (state.get("abc") - state.get("abc_prev")) if state.get("abc") is not None and state.get("abc_prev") is not None else None,
@@ -1352,6 +1441,11 @@ with tabs[3]:
                 "XL -2": state.get("xl_prev"),
                 "XL osakaal -1": (state.get("xl") / state.get("total")) if state.get("xl") is not None and state.get("total") not in (None, 0) else None,
                 "XL osakaal -2": (state.get("xl_prev") / state.get("total_prev")) if state.get("xl_prev") is not None and state.get("total_prev") not in (None, 0) else None,
+                "Koormusindeks -1": state.get("load_index"),
+                "Ülekoormus -1": state.get("overload"),
+                "2 korje koormus": state.get("load2_index"),
+                "Tipukorje -1": state.get("peak"),
+                "Tipukorje -2": state.get("peak_prev"),
             }
             for k, v in wx.items():
                 if k.startswith(("T viim", "Rad viim", "Sade viim", "ET0 viim", "Niiskus viim")):
@@ -1378,10 +1472,18 @@ with tabs[3]:
             if wx is None:
                 return None
             base_values = [wx[c] for c in base_cont_cols]
-            abc_pred = _predict_full_generic(
-                full_abc_model, field_no, base_values,
-                _champion_feature_values(state, wx),
-            )
+            # Bioloogilise koormuse korrektsioon on lubatud ainult siis, kui sihtkorje
+            # eelmine sama põllu korje on päriselt mõõdetud. Kui vahepealne eelkorje on
+            # ise tulevikuprognoos, ei toida me mudelit tema enda väljundiga tagasi.
+            if champion_uses_biological_load and state.get("source") != "tegelik":
+                abc_pred = _predict_full_generic(full_abc_base_model, field_no, base_values, [])
+                abc_mode = "weather-first fallback"
+            else:
+                abc_pred = _predict_full_generic(
+                    full_abc_model, field_no, base_values,
+                    _champion_feature_values(state, wx),
+                )
+                abc_mode = champion_name
             xl_pred = _predict_full_generic(
                 full_xl_model, field_no, base_values,
                 [state.get("xl"), state.get("xl_prev"), state.get("abc"), state.get("total")],
@@ -1394,10 +1496,12 @@ with tabs[3]:
             cb_pred = float(np.exp(np.clip(cb_log_pred, np.log(0.10), np.log(10.0))))
             return {
                 "abc": abc_pred, "xl": xl_pred, "cb": cb_pred, "total": abc_pred + xl_pred,
-                "interval": wx["Intervall p"], "estimated_days": estimated_days or set(),
+                "interval": wx["Intervall p"], "estimated_days": estimated_days or set(), "abc_mode": abc_mode,
             }
 
         field_state = {}
+        field_actual_abc_hist = {}
+        field_peak_hist = {}
         for row in sorted(harvest_rows, key=lambda r: (str(r.get("harvest_date") or ""), int(r.get("harvest_order") or 99))):
             try:
                 d = date.fromisoformat(str(row.get("harvest_date")))
@@ -1407,15 +1511,32 @@ with tabs[3]:
             except (TypeError, ValueError):
                 continue
             if d <= TODAY:
+                quality = str(row.get("data_quality") or "").strip().lower()
                 old = field_state.get(f)
+                abc_value = a + b + c
+                hist = field_actual_abc_hist.setdefault(f, [])
+                peak_hist = field_peak_hist.setdefault(f, [])
+                prior = hist[-3:]
+                baseline = float(np.mean(prior)) if prior else None
+                load_index = (abc_value / baseline) if (baseline is not None and baseline > 0) else None
+                overload = max(0.0, load_index - 1.0) if load_index is not None else None
+                load2_index = None
+                if prior:
+                    load2_index = (float(np.mean([abc_value, prior[-1]])) / baseline) if baseline > 0 else None
+                peak = 1.0 if (load_index is not None and load_index >= 1.25) else 0.0 if load_index is not None else None
                 field_state[f] = {
-                    "date": d, "abc": a + b + c,
+                    "date": d, "abc": abc_value,
                     "abc_prev": old.get("abc") if old else None,
                     "xl": xl, "xl_prev": old.get("xl") if old else None,
                     "cb": (c / b) if b > 0 else None, "cb_prev": old.get("cb") if old else None,
                     "total": total_value, "total_prev": old.get("total") if old else None,
+                    "load_index": load_index, "overload": overload, "load2_index": load2_index,
+                    "peak": peak, "peak_prev": peak_hist[-1] if peak_hist else None,
                     "source": "tegelik",
                 }
+                if quality not in {"hinnanguline", "ligikaudne"}:
+                    hist.append(abc_value)
+                    peak_hist.append(peak)
 
         today_rows_live = db.get_harvest_for_day(TODAY)
         today_plan = _planned_fields_for_day(TODAY, today_rows_live, harvest_rows)
@@ -1427,15 +1548,31 @@ with tabs[3]:
             if actual:
                 try:
                     old = field_state.get(int(f))
+                    # harvest_rows sisaldab tavaliselt juba tänast salvestatud rida; ära lisa
+                    # sama tegelikku korjet koormusajalukku teist korda.
+                    if old and old.get("date") == TODAY and old.get("source") == "tegelik":
+                        continue
                     a=float(actual.get("a")); b=float(actual.get("b")); c=float(actual.get("c")); xl=float(actual.get("xl")); total=float(actual.get("total"))
+                    abc_value = a + b + c
+                    hist = field_actual_abc_hist.setdefault(int(f), [])
+                    peak_hist = field_peak_hist.setdefault(int(f), [])
+                    prior = hist[-3:]
+                    baseline = float(np.mean(prior)) if prior else None
+                    load_index = (abc_value / baseline) if (baseline is not None and baseline > 0) else None
+                    overload = max(0.0, load_index - 1.0) if load_index is not None else None
+                    load2_index = (float(np.mean([abc_value, prior[-1]])) / baseline) if (prior and baseline and baseline > 0) else None
+                    peak = 1.0 if (load_index is not None and load_index >= 1.25) else 0.0 if load_index is not None else None
                     field_state[int(f)] = {
-                        "date": TODAY, "abc": a+b+c,
+                        "date": TODAY, "abc": abc_value,
                         "abc_prev": old.get("abc") if old else None,
                         "xl": xl, "xl_prev": old.get("xl") if old else None,
                         "cb": (c / b) if b > 0 else None, "cb_prev": old.get("cb") if old else None,
                         "total": total, "total_prev": old.get("total") if old else None,
+                        "load_index": load_index, "overload": overload, "load2_index": load2_index,
+                        "peak": peak, "peak_prev": peak_hist[-1] if peak_hist else None,
                         "source": "tegelik",
                     }
+                    hist.append(abc_value); peak_hist.append(peak)
                     continue
                 except (TypeError, ValueError):
                     pass
@@ -1449,6 +1586,8 @@ with tabs[3]:
                     "xl": nowcast["xl"], "xl_prev": prev.get("xl"),
                     "cb": nowcast["cb"], "cb_prev": prev.get("cb"),
                     "total": nowcast["total"], "total_prev": prev.get("total"),
+                    "load_index": None, "overload": None, "load2_index": None,
+                    "peak": None, "peak_prev": prev.get("peak"),
                     "source": "prognoos",
                 }
                 internal_today.append((int(f), nowcast["total"]))
@@ -1472,6 +1611,8 @@ with tabs[3]:
                     continue
                 any_weather_imputation.update(result["estimated_days"])
                 source_label = "tegelik eelkorje" if prev["source"] == "tegelik" else "prognoositud eelkorje"
+                if result.get("abc_mode") == "weather-first fallback":
+                    source_label += " · ABC weather-first fallback"
                 day_rows.append({
                     "Põld": f, "A+B+C": result["abc"], "C/B": result["cb"], "XL": result["xl"], "Kokku": result["total"],
                     "Intervall": result["interval"], "Alus": source_label,
@@ -1482,6 +1623,8 @@ with tabs[3]:
                     "xl": result["xl"], "xl_prev": prev.get("xl"),
                     "cb": result["cb"], "cb_prev": prev.get("cb"),
                     "total": result["total"], "total_prev": prev.get("total"),
+                    "load_index": None, "overload": None, "load2_index": None,
+                    "peak": None, "peak_prev": prev.get("peak"),
                     "source": "prognoos",
                 }
             forecast_days.append((target_day, day_rows))
@@ -1492,7 +1635,7 @@ with tabs[3]:
         # Mudeliversioon tähistab champion-valiku raamistikku, mitte tänase võitja nime.
         # Nii uuendab sama päeva rerun sama operatiivset snapshot'i ka siis, kui champion
         # uue korje järel päeva jooksul muutub. Võitja nimi salvestub basis-väljale.
-        MODEL_VERSION = "v6.3-weather-first-champion-v3"
+        MODEL_VERSION = "v6.3-weather-load-champion-v5"
         forecast_payloads = []
         for target_day, rows_day in forecast_days:
             for row in rows_day:
@@ -1557,11 +1700,11 @@ with tabs[3]:
 
         abc_mae_text = f"{current_test_mae:.1f} kasti/põld" if current_test_mae is not None else "veel hindamata"
         total_mae_text = f"{current_total_test_mae:.1f} kasti/põld" if current_total_test_mae is not None else "veel hindamata"
-        lag_note = " Kui champion kasutab saagimälu, kasvab kaugemates 6–9 päeva prognoosides rekursioonirisk." if any(c in champion_cols for c in ["Eelmine ABC", "Eelmine2 ABC", "ABC trend", "Eelmine saak"]) else ""
         st.caption(
             f"A+B+C ajaline testviga: {abc_mae_text}. Kogusaagi (ABC+XL) testviga: {total_mae_text}. "
             f"1–3 päeva on operatiivne vaade, 4–5 päeva planeerimisvaade ja 6–9 päeva kollasega märgitud trendiprognoos. "
-            f"Kaugematel päevadel kasvab ebakindlus eelkõige ilmaprognoosi tõttu.{lag_note}"
+            "A+B+C prognoosi baas on weather-first. Tõestatud bioloogiline koormus võib korrigeerida ainult siis, kui eelkorje on päriselt mõõdetud; "
+            "prognoositud eelkorjet ei kasutata koormuse tagasisidena. Kaugematel päevadel kasvab ebakindlus eelkõige ilmaprognoosi tõttu."
         )
 
         # -------------------------------------------------------------------------
@@ -1656,6 +1799,9 @@ with tabs[3]:
                     "A+B+C trend 2 korjet": "kas kahe viimase korje saagisuund annab järgmise korje kohta lisasignaali",
                     "Korjejääk / kõrge eelkorje": "kas kõrge eelkorje koos XL-jäljega viitab vahele jäänud viljale või järelmõjule",
                     "XL osakaal 2 korjet": "kas XL osakaalu mälu kannab järgmisse korjesse kasutatavat signaali",
+                    "Ebatavaline koormus -1": "kas eelmise korje ebatavaliselt suur A+B+C võrreldes sama põllu varasema tasemega jätab järgmisse korjesse taastumisefekti",
+                    "Kahe korje koormus": "kas kahe järjestikuse korje keskmisest suurem koormus vähendab järgmise korje potentsiaali",
+                    "Tipukorje järelmõju": "kas selge tipukorje mõju avaldub 1–2 korjet hiljem, mitte toore eelmise saagi ankurdusena",
                     "Viimase 1 päeva ilm": "kas korje-eelse viimase päeva ilm on tähtsam kui kogu korjevahemiku keskmine",
                     "Viimase 2 päeva ilm": "kas korje-eelse kahe päeva ilm annab eraldi lisasignaali",
                     "Viimase 3 päeva ilm": "kas korje-eelse kolme päeva ilm annab eraldi lisasignaali",
@@ -1676,12 +1822,17 @@ with tabs[3]:
 
                 operational_trace = trace_df[trace_df["Jälg"].isin(operational_candidate_groups.keys())].copy()
                 operational_trace = operational_trace.sort_values("Paranemine", ascending=False)
+                memory_trace = trace_df[trace_df["Jälg"].isin(memory_diagnostic_groups.keys())].copy()
+                memory_trace = memory_trace.sort_values("Paranemine", ascending=False)
 
                 st.markdown("**Mida ma täna kaalusin**")
                 considered = []
-                for _, r in operational_trace.iterrows():
+                for _, r in trace_df.sort_values("Paranemine", ascending=False).iterrows():
                     name = r["Jälg"]
-                    considered.append(f"**{name}** — {trace_hypotheses.get(name, 'lisatunnuse võimalik mõju')}")
+                    role = ("weather-first kandidaat" if name in weather_candidate_groups else
+                            "bioloogilise koormuse kandidaat" if name in biological_load_candidate_groups else
+                            "uurimisjälg (ei juhi prognoosi)")
+                    considered.append(f"**{name}** — {trace_hypotheses.get(name, 'lisatunnuse võimalik mõju')} · {role}")
                 if considered:
                     st.markdown(";  ".join(considered) + ".")
 
@@ -1699,7 +1850,18 @@ with tabs[3]:
                         f"Weather-first baasi MAE on {champion_mae:.2f} kasti."
                     )
 
-                # Lähim kandidaat = parima paranemisega operatiivne kandidaat, mis pole champion.
+                if not memory_trace.empty:
+                    best_memory = memory_trace.iloc[0]
+                    st.markdown("**Tugevaim ajalooline mälusignaal (ainult uurimiseks)**")
+                    direction = "parandas" if float(best_memory["Paranemine"]) > 0 else "ei parandanud"
+                    st.write(
+                        f"**{best_memory['Jälg']}** {direction} samadel testiridadel MAE-d "
+                        f"{best_memory['Paranemine']:+.2f} kasti ja võitis {best_memory['Võidab ridu %']:.0f}% ridadest. "
+                        "Seda ei kasutata A+B+C operatiivse championina isegi siis, kui ajalooline sobivus on hea, "
+                        "sest järsu ilmamuutuse korral peab prognoosi juhtima kasvuilm, mitte eelmise korje tase."
+                    )
+
+                # Lähim kandidaat = parima paranemisega lubatud (ilm või bioloogiline koormus) kandidaat, mis pole champion.
                 nearest = None
                 for _, r in operational_trace.iterrows():
                     if r["Jälg"] != champion_name:
@@ -1718,16 +1880,19 @@ with tabs[3]:
                         f"Praegu ei tõsta ma seda championiks, sest {status_text}."
                     )
 
-                watch = operational_trace[(operational_trace["Paranemine"] > 0) & (~operational_trace["Stabiilne"])].head(3)
+                watch = trace_df[(trace_df["Paranemine"] > 0) & (~trace_df["Stabiilne"])].sort_values("Paranemine", ascending=False).head(4)
                 if not watch.empty:
                     st.markdown("**Hoian silma peal**")
                     for _, r in watch.iterrows():
+                        role = ("weather-first kandidaat" if r["Jälg"] in weather_candidate_groups else
+                                "bioloogilise koormuse kandidaat" if r["Jälg"] in biological_load_candidate_groups else
+                                "uurimisjälg")
                         st.write(
-                            f"• **{r['Jälg']}** — praegu {r['Paranemine']:+.2f} kasti MAE muutus; "
+                            f"• **{r['Jälg']}** ({role}) — praegu {r['Paranemine']:+.2f} kasti MAE muutus; "
                             f"{_why_not_stable(r)}. Uute korjetega kontrollin seda uuesti."
                         )
 
-                rejected = operational_trace[operational_trace["Paranemine"] <= 0].head(4)
+                rejected = trace_df[trace_df["Paranemine"] <= 0].sort_values("Paranemine", ascending=False).head(5)
                 if not rejected.empty:
                     st.markdown("**Praegu kõrvale jäetud**")
                     for _, r in rejected.iterrows():
@@ -1747,7 +1912,8 @@ with tabs[3]:
                         use_container_width=True, hide_index=True,
                     )
                     st.caption(
-                        f"Aktiivne champion: {champion_name}. Valik arvutatakse uuesti iga uue korje järel. "
+                        f"Aktiivne A+B+C champion: {champion_name}. Valik arvutatakse uuesti iga uue korje järel. "
+                        "Toored saagimälu tunnused on raportis diagnostilised; normaliseeritud bioloogiline koormus võib championiks saada ainult stabiilse tõendi korral. "
                         "Toortabel on alles kontrolliks; põhiinfo on ülal uurimisraportis."
                     )
     else:
@@ -1757,7 +1923,7 @@ with tabs[3]:
     st.write(
         "Põhimudeli õppimisnäite siht on konkreetse põllu järgmise korje A+B+C. XL õpitakse eraldi korjejäägi komponendina. Sisenditesse saab ilmavahemikust "
         "arvutada näiteks temperatuuri, radiatsiooni, sademete, õhuniiskuse ja ET0 summad/keskmised ning "
-        "korjeintervalli. Eelmise korje saak võib olla üks lisatunnus, kuid ei ole prognoosi põhialus."
+        "korjeintervalli. Toores eelmine saak ei ole prognoosi sisendankur; ainult sellest tuletatud ja walk-forward testiga tõestatud bioloogiline koormus võib weather-first baasi korrigeerida."
     )
 
     if last_complete_harvest and latest_harvest and latest_harvest > last_complete_harvest:
@@ -1766,7 +1932,7 @@ with tabs[3]:
         )
 
     st.divider()
-    st.info("Mudel töötab kahekihiliselt: ilma- ja kasvudünaamikapõhine A+B+C champion-põhimudel + eraldi XL-komponent. Eelmine saak ei ole baasmudeli alus; Jäljeotsija võib saagimälu kasutada ainult siis, kui see läbib ausa stabiilsustesti.")
+    st.info("Mudel töötab kihiliselt: weather-first A+B+C baas + ainult tõestatud bioloogilise koormuse korrektsioon + eraldi XL ja C/B komponendid. Toores eelmine saak ei ole prognoosi ankur ega champion-tunnus.")
 
 with tabs[4]:
     st.subheader("Mootori tähelepanekud")
