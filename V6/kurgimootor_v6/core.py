@@ -424,7 +424,7 @@ class WeatherService:
 
     def _refresh_measured_incremental(self, today: date) -> Dict[str, Any]:
         season_start = date(today.year, 7, 1)
-        # Ametlikud päevad võivad saabuda viitega. Automaatika loeb kindlalt kuni üle-eilseni.
+        # Ametlikud päevad võivad saabuda viitega. Automaatika loeb kuni eilseni.
         target_end = today - timedelta(days=1)
         if target_end < season_start:
             return {"saved": 0, "checked": 0, "ranges": []}

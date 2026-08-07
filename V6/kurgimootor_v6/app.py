@@ -7,7 +7,7 @@ import db
 from core import WeatherService
 
 TODAY = date.today()
-st.set_page_config(page_title="KurgiMootor V6.2", page_icon="🥒", layout="wide")
+st.set_page_config(page_title="KurgiMootor V6.3", page_icon="🥒", layout="wide")
 
 
 def _n(value) -> float:
@@ -191,7 +191,7 @@ try:
 except Exception as exc:
     db.set_app_setting("weather_last_error", f"Automaatne ilmauuendus: {exc}")
 
-st.title("KurgiMootor V6.2")
+st.title("KurgiMootor V6.3")
 st.caption("Saagi ennustamise tööriist. Avaleht on töövoog, mitte ilmarakendus.")
 
 tabs = st.tabs(["Täna", "Korjed", "Ilm", "Prognoos", "Mootori tähelepanekud"])
@@ -522,7 +522,7 @@ with tabs[3]:
             if idx == 0:
                 first_harvest_rows.append((field_no, current_day))
                 continue
-            previous_day = items[idx - 1][0]
+            previous_day, previous_row = items[idx - 1]
             window_start = previous_day + timedelta(days=1)
             window_end = current_day
             expected_days = max(0, (window_end - window_start).days + 1)
@@ -540,6 +540,8 @@ with tabs[3]:
                 "interval_days": (current_day - previous_day).days,
                 "weather_days": expected_days,
                 "missing_days": missing_days,
+                "current_row": row,
+                "previous_row": previous_row,
             }
             if missing_days:
                 incomplete_samples.append(sample)
@@ -629,6 +631,113 @@ with tabs[3]:
                     f"• Põld {sample['field_no']}: {sample['previous_day'].strftime('%d.%m')} → "
                     f"{sample['current_day'].strftime('%d.%m')} — puuduv ilm: {missing_text}"
                 )
+
+    st.markdown("##### Õppimisandmestik")
+    st.caption(
+        "Üks rida = ühe põllu üks järgmine korje. Ilmatunnused arvutatakse ainult selle põllu "
+        "eelmise ja järgmise korje vahele jäävatest mõõdetud päevadest. Siht on tegelik kogusaak."
+    )
+
+    training_rows = []
+    for sample in usable_samples:
+        current_row = sample.get("current_row") or {}
+        previous_row = sample.get("previous_row") or {}
+
+        # Õpperea siht peab olema päriselt numbriline. Osaline vana kirje võib olla
+        # kasvuperioodi alguspunkt, kuid seda ei kasutata ise sihtreana.
+        try:
+            target_total = float(current_row.get("total"))
+        except (TypeError, ValueError):
+            continue
+
+        window_weather = []
+        cursor = sample["previous_day"] + timedelta(days=1)
+        while cursor <= sample["current_day"]:
+            wr = weather_by_day.get(cursor.isoformat())
+            if wr:
+                window_weather.append(wr)
+            cursor += timedelta(days=1)
+
+        if len(window_weather) != sample["weather_days"] or not window_weather:
+            continue
+
+        daily_mean_t = [(_n(w.get("temp_min_c")) + _n(w.get("temp_max_c"))) / 2 for w in window_weather]
+        rad = [_n(w.get("radiation_mj_m2")) for w in window_weather]
+        rain = [_n(w.get("precipitation_mm")) for w in window_weather]
+        hum = [_n(w.get("humidity_avg_pct")) for w in window_weather]
+        et0 = [_n(w.get("et0_mm")) for w in window_weather]
+        wind = [_n(w.get("wind_avg_ms")) for w in window_weather]
+
+        previous_total = previous_row.get("total")
+        try:
+            previous_total = float(previous_total) if previous_total is not None else None
+        except (TypeError, ValueError):
+            previous_total = None
+
+        training_rows.append({
+            "Kuupäev": sample["current_day"],
+            "Põld": sample["field_no"],
+            "Intervall p": sample["interval_days"],
+            "Saak": target_total,
+            "Eelmine saak": previous_total,
+            "T kesk": sum(daily_mean_t) / len(daily_mean_t),
+            "Radiatsioon Σ": sum(rad),
+            "Radiatsioon/p": sum(rad) / len(rad),
+            "Sademed Σ": sum(rain),
+            "Niiskus kesk": sum(hum) / len(hum),
+            "ET0 Σ": sum(et0),
+            "Tuul kesk": sum(wind) / len(wind),
+            "A": current_row.get("a"),
+            "B": current_row.get("b"),
+            "C": current_row.get("c"),
+            "XL": current_row.get("xl"),
+            "Andmekvaliteet": current_row.get("data_quality") or "",
+        })
+
+    if training_rows:
+        training_df = pd.DataFrame(training_rows).sort_values(["Kuupäev", "Põld"], ascending=[False, True])
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Valmis õppimisridu", len(training_df))
+        t2.metric("Keskmine intervall", f"{training_df['Intervall p'].mean():.1f} p")
+        t3.metric("Keskmine saak", f"{training_df['Saak'].mean():.1f} kasti")
+
+        display_df = training_df.copy()
+        display_df["Kuupäev"] = display_df["Kuupäev"].map(lambda d: d.strftime("%d.%m"))
+        st.dataframe(
+            display_df.style.format({
+                "Saak": "{:.1f}",
+                "Eelmine saak": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                "T kesk": "{:.1f}",
+                "Radiatsioon Σ": "{:.1f}",
+                "Radiatsioon/p": "{:.1f}",
+                "Sademed Σ": "{:.1f}",
+                "Niiskus kesk": "{:.1f}",
+                "ET0 Σ": "{:.1f}",
+                "Tuul kesk": "{:.1f}",
+                "A": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
+                "B": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
+                "C": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
+                "XL": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "Radiatsioon Σ, sademed Σ ja ET0 Σ on kogu korjevahemiku summad; T, niiskus ja tuul on "
+            "sama vahemiku päevade keskmised. Eelmine saak on nähtaval võrdluseks, mitte kohustuslik põhisisend."
+        )
+
+        csv_df = training_df.copy()
+        csv_df["Kuupäev"] = csv_df["Kuupäev"].map(lambda d: d.isoformat())
+        st.download_button(
+            "Laadi õppimisandmestik CSV-na",
+            data=csv_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="kurgimootor_training_dataset.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("Täieliku ilmavahemiku ja numbrilise saagiga õppimisridu ei ole veel piisavalt.")
 
     st.markdown("##### Mida mudel hiljem sellest kasutab")
     st.write(
