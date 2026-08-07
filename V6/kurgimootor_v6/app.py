@@ -154,6 +154,10 @@ def _short_date(value: date) -> str:
     return f"{value.day:02d}. {months[value.month - 1]}"
 
 
+def _weekday_letter(value: date) -> str:
+    return ["E", "T", "K", "N", "R", "L", "P"][value.weekday()]
+
+
 def _daily_summary(rows):
     count = len(rows)
     a = sum(_n(r.get("a")) for r in rows)
@@ -315,16 +319,35 @@ st.caption("Saagi ennustamise tööriist. Avaleht on töövoog, mitte ilmarakend
 tabs = st.tabs(["Täna", "Korjed", "Ilm", "Prognoos", "Mootori tähelepanekud"])
 
 with tabs[0]:
-    st.subheader("Täna")
     today_rows = db.get_harvest_for_day(TODAY)
     harvest_history_for_plan = db.get_harvest_history()
     today_planned_fields = _planned_fields_for_day(TODAY, today_rows, harvest_history_for_plan)
+
+    if len(today_planned_fields) >= 2:
+        fields_text = ", ".join(str(f) for f in today_planned_fields[:-1]) + f" ja {today_planned_fields[-1]}"
+    elif today_planned_fields:
+        fields_text = str(today_planned_fields[0])
+    else:
+        fields_text = "—"
+
+    st.markdown(
+        f"""
+        <div style="display:flex;justify-content:space-between;align-items:end;gap:16px;margin-bottom:8px;">
+          <div>
+            <div style="font-size:1.15rem;font-weight:650;opacity:.82;">Täna korjatakse põllud nr {fields_text}</div>
+            <div style="font-size:2.15rem;font-weight:900;line-height:1.05;margin-top:4px;">{_short_date(TODAY)}</div>
+          </div>
+          <div style="font-size:3.4rem;font-weight:950;line-height:1;opacity:.22;">{_weekday_letter(TODAY)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # Avaleht = tänane töö + tänane prognoos. Analüütilised detailid jäävad Prognoos-menüüsse.
     home_left, home_right = st.columns([1.55, 1.0], gap="large")
 
     with home_left:
-        st.markdown("#### Tänased põllud ja korje")
+        st.markdown("#### Tänane korje")
         selected_today_fields = st.multiselect(
             "Täna korjatavad põllud",
             options=list(range(1, 15)),
@@ -388,9 +411,26 @@ with tabs[0]:
             actual = _daily_summary(live_rows)
             actual_cb = "—" if actual["cb"] is None else _fmt(actual["cb"], 2)
             st.markdown(
-                f"**Tegelik seni: {_fmt(actual['total'])} kasti**  "
-                f"· A {_fmt(actual['a'])} · B {_fmt(actual['b'])} · C {_fmt(actual['c'])} "
-                f"· XL {_fmt(actual['xl'])} · C/B {actual_cb}"
+                f"""
+                <div style="border:1px solid rgba(128,128,128,.25);border-radius:12px;padding:12px 14px;margin-top:10px;">
+                  <div style="font-size:.80rem;font-weight:900;letter-spacing:.10em;opacity:.58;">TEGELIK</div>
+                  <div style="font-size:2.15rem;font-weight:900;line-height:1.05;margin-top:3px;">{_fmt(actual['total'])} kasti</div>
+                  <div style="font-size:.92rem;opacity:.74;margin-top:6px;">
+                    A {_fmt(actual['a'])} · B {_fmt(actual['b'])} · C {_fmt(actual['c'])} · XL {_fmt(actual['xl'])} · C/B {actual_cb}
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                """
+                <div style="border:1px solid rgba(128,128,128,.20);border-radius:12px;padding:12px 14px;margin-top:10px;">
+                  <div style="font-size:.80rem;font-weight:900;letter-spacing:.10em;opacity:.58;">TEGELIK</div>
+                  <div style="font-size:2.15rem;font-weight:900;line-height:1.05;margin-top:3px;">0,0 kasti</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
     with home_right:
@@ -2309,14 +2349,19 @@ with tabs[3]:
                 cb_fc_text = "—" if today_cb_fc is None else _fmt(today_cb_fc, 2)
                 with home_today_forecast_slot.container():
                     st.markdown("#### Tänane prognoos")
-                    st.metric(
-                        f"Põllud {' · '.join(str(f) for f in today_plan)}",
-                        f"{_fmt(today_total_fc)} kasti",
+                    st.markdown(
+                        f"""
+                        <div style="border:2px solid rgba(76,160,92,.38);border-radius:12px;padding:14px 16px;">
+                          <div style="font-size:.80rem;font-weight:900;letter-spacing:.10em;opacity:.58;">PROGNOOS</div>
+                          <div style="font-size:2.45rem;font-weight:950;line-height:1.05;margin-top:3px;">{_fmt(today_total_fc)} kasti</div>
+                          <div style="font-size:.94rem;opacity:.76;margin-top:7px;">
+                            põllud {' · '.join(str(f) for f in today_plan)}<br>
+                            A+B+C {_fmt(today_abc_fc)} · XL {_fmt(today_xl_fc)} · C/B ~{cb_fc_text}
+                          </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
                     )
-                    st.caption(
-                        f"A+B+C {_fmt(today_abc_fc)} · XL {_fmt(today_xl_fc)} · C/B ~{cb_fc_text}"
-                    )
-                    st.caption("Prognoos on lukustatud enne tänaste tegelike korjeridade rakendamist.")
             else:
                 with home_today_forecast_slot.container():
                     st.markdown("#### Tänane prognoos")
@@ -2342,8 +2387,11 @@ with tabs[3]:
                         f"""
                         <div style="background:{bg};border:1px solid {border};border-radius:10px;
                                     padding:10px 12px;margin:7px 0;">
-                          <div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline;">
-                            <strong style="font-size:1.05rem;">{_short_date(target_day)}</strong>
+                          <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;">
+                            <div style="display:flex;align-items:center;gap:10px;">
+                              <span style="font-size:1.65rem;font-weight:950;opacity:.38;">{_weekday_letter(target_day)}</span>
+                              <strong style="font-size:1.05rem;">{_short_date(target_day)}</strong>
+                            </div>
                             <strong style="font-size:1.15rem;">{_fmt(total_day)} kasti{badge}</strong>
                           </div>
                           <div style="font-size:0.90rem;opacity:0.78;margin-top:3px;">
