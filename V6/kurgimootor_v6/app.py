@@ -324,6 +324,12 @@ with tabs[0]:
     harvest_history_for_plan = db.get_harvest_history()
     today_planned_fields = _planned_fields_for_day(TODAY, today_rows, harvest_history_for_plan)
 
+    # Uue päeva alguses lähtuvad kõik tänase vaate osad samast põlluplaanist.
+    current_home_day = TODAY.isoformat()
+    if st.session_state.get("home_plan_day") != current_home_day:
+        st.session_state["home_plan_day"] = current_home_day
+        st.session_state["home_today_fields"] = list(today_planned_fields)
+
     if len(today_planned_fields) >= 2:
         fields_text = ", ".join(str(f) for f in today_planned_fields[:-1]) + f" ja {today_planned_fields[-1]}"
     elif today_planned_fields:
@@ -352,9 +358,8 @@ with tabs[0]:
         selected_today_fields = st.multiselect(
             "Täna korjatavad põllud",
             options=list(range(1, 15)),
-            default=today_planned_fields,
             key="home_today_fields",
-            help="Vaikimisi 3 järjestikust põldu. Kui täna korjatakse ainult 2, eemalda kolmas.",
+            help="Vaikimisi tänase plaani põllud. Kui täna korjatakse ainult 2, eemalda kolmas.",
         )
         if len(selected_today_fields) > 3:
             st.warning("Vali tänaseks kuni 3 põldu.")
