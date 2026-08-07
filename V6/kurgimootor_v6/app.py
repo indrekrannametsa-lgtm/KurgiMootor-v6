@@ -110,11 +110,38 @@ with tabs[2]:
             st.success("Ilmaandmed uuendatud.")
         st.rerun()
 
-    rows = db.get_weather_rows(TODAY - timedelta(days=30), TODAY + timedelta(days=8))
-    measured_rows = [r for r in rows if r.get("data_kind") == "measured"][-14:][::-1]
-    forecast_rows = [r for r in rows if r.get("data_kind") == "forecast"]
+    # Ilmaajalugu on äpis vabalt vaadeldav. Vaikimisi näitame kogu selle hooaja
+    # mõõdetud ajalugu alates 1. juulist; see valik mõjutab ainult vaadet, mitte
+    # mootorile salvestatud andmeid.
+    history_default_start = date(TODAY.year, 7, 1)
+    history_default_end = TODAY
+    st.subheader("Mõõdetud ilma ajalugu")
+    d1, d2 = st.columns(2)
+    history_start = d1.date_input(
+        "Alguskuupäev",
+        value=history_default_start,
+        max_value=TODAY,
+        key="weather_history_start",
+    )
+    history_end = d2.date_input(
+        "Lõppkuupäev",
+        value=history_default_end,
+        max_value=TODAY,
+        key="weather_history_end",
+    )
+    if history_start > history_end:
+        st.warning("Alguskuupäev peab olema lõppkuupäevast varasem.")
+        measured_rows = []
+    else:
+        history_rows = db.get_weather_rows(history_start, history_end)
+        measured_rows = [r for r in history_rows if r.get("data_kind") == "measured"][::-1]
 
-    st.subheader("Viimased mõõdetud päevad")
+    forecast_rows = [
+        r for r in db.get_weather_rows(TODAY, TODAY + timedelta(days=8))
+        if r.get("data_kind") == "forecast"
+    ]
+
+    st.caption(f"Kuvatakse {len(measured_rows)} mõõdetud päeva. Kõik salvestatud ilmaandmed jäävad mootorile kasutada sõltumata valitud vaatest.")
     measured_display = [{
         "Kuupäev": r["weather_date"],
         "Min °C": r.get("temp_min_c"),
