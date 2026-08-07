@@ -1407,6 +1407,97 @@ with tabs[3]:
             latent = float((Xp @ model["beta"])[0])
             return float(np.exp(np.clip(latent, np.log(ABC_LOG_EPS), 6.0)))
 
+        def _abc_growth_explain(model, field_no, base_values, extra_values, extra_names):
+            """Jaga V6.4 log-mudeli prognoos täpselt +/- kastipanusteks.
+
+            Referents on mudeli neutraalne treeningtase: standardiseeritud pidevad tunnused = 0,
+            puuduvad lisatunnused = 0 ja põlluefekt = 0. Kuna exp() on mittelineaarne,
+            skaleerime latentse lineaarse panuse ühiselt tagasi kastiskaalale. Nii kehtib:
+            mudelibaas + kõigi tegurite panused = A+B+C prognoos.
+            """
+            x = list(base_values)
+            miss = []
+            for i, value in enumerate(extra_values):
+                try:
+                    finite_value = value is not None and np.isfinite(float(value))
+                except (TypeError, ValueError):
+                    finite_value = False
+                if not finite_value:
+                    x.append(model["fills"][i])
+                    miss.append(1.0)
+                else:
+                    x.append(float(value))
+                    miss.append(0.0)
+
+            x = np.array(x, dtype=float)
+            z = (x - model["means"]) / model["scales"]
+            z = np.clip(z, -model.get("z_clip", 2.5), model.get("z_clip", 2.5))
+
+            beta = model["beta"]
+            n_base = len(base_cont_cols)
+            n_extra = len(extra_values)
+            groups = {
+                "Temperatuur": 0.0, "Radiatsioon": 0.0, "Sademed": 0.0,
+                "Niiskus": 0.0, "ET0": 0.0, "Tuul": 0.0,
+                "Intervall": 0.0, "Hooaeg": 0.0, "Põlluefekt": 0.0,
+                "Biokoormus": 0.0, "Muu": 0.0,
+            }
+
+            def _group_for_feature(name):
+                if name == "Intervall p":
+                    return "Intervall"
+                if name == "Hooajapäev":
+                    return "Hooaeg"
+                if name == "T kesk" or str(name).startswith("T viim"):
+                    return "Temperatuur"
+                if str(name).startswith("Radiatsioon") or str(name).startswith("Rad viim"):
+                    return "Radiatsioon"
+                if str(name).startswith("Sademed") or str(name).startswith("Sade viim"):
+                    return "Sademed"
+                if str(name).startswith("Niiskus"):
+                    return "Niiskus"
+                if str(name).startswith("ET0"):
+                    return "ET0"
+                if str(name).startswith("Tuul"):
+                    return "Tuul"
+                if name in {"Koormusindeks -1", "Ülekoormus -1", "2 korje koormus", "Tipukorje -1", "Tipukorje -2"}:
+                    return "Biokoormus"
+                return "Muu"
+
+            numeric_names = list(base_cont_cols) + list(extra_names)
+            for j, name in enumerate(numeric_names):
+                groups[_group_for_feature(name)] += float(beta[1 + j] * z[j])
+
+            # Lisatunnuste missing-indikaatorid kuuluvad sama teguri panuse sisse.
+            miss_start = 1 + len(numeric_names)
+            for j, name in enumerate(extra_names):
+                groups[_group_for_feature(name)] += float(beta[miss_start + j] * miss[j])
+
+            field_start = miss_start + n_extra
+            if 1 <= int(field_no) <= 14:
+                groups["Põlluefekt"] += float(beta[field_start + int(field_no) - 1])
+
+            intercept = float(beta[0])
+            latent_delta = float(sum(groups.values()))
+            latent = intercept + latent_delta
+            pred = float(np.exp(np.clip(latent, np.log(ABC_LOG_EPS), 6.0)))
+            baseline = float(np.exp(np.clip(intercept, np.log(ABC_LOG_EPS), 6.0)))
+
+            # Monotoonse exp() korral on see ühine positiivne skaalategur.
+            # Panused säilitavad märgi ja summeeruvad täpselt prognoosini.
+            if abs(latent_delta) > 1e-12:
+                scale = (pred - baseline) / latent_delta
+                crate_effects = {k: float(v * scale) for k, v in groups.items()}
+            else:
+                crate_effects = {k: 0.0 for k in groups}
+
+            return {
+                "baseline": baseline,
+                "effects": crate_effects,
+                "reconstructed": baseline + sum(crate_effects.values()),
+                "prediction": pred,
+            }
+
         champion_extra_arrays = [
             pd.to_numeric(model_df[c], errors="coerce").to_numpy(dtype=float) for c in champion_cols
         ]
@@ -1556,23 +1647,20 @@ with tabs[3]:
             # eelmine sama põllu korje on päriselt mõõdetud. Kui vahepealne eelkorje on
             # ise tulevikuprognoos, ei toida me mudelit tema enda väljundiga tagasi.
             if champion_uses_biological_load and state.get("source") != "tegelik":
-                # Sama põld võib 9 päeva aknas tulla uuesti korjesse. Sellisel juhul ei tohi
-                # vahepealset PROGNOOSITUD saaki kasutada järgmise korje biokoormuse sisendina.
-                # Samas ei tohi ka hüpata eraldi treenitud baasmudelile, sest selle koefitsiendid
-                # võivad väikese andmestiku korral anda kunstliku mudelivahetuse (sh nulli kukkumise).
-                # Hoidame sama championi weather-first osa ning neutraliseerime ainult teadmata
-                # bioloogilise koormuse lisatunnused mudeli enda keskmisele/missing-režiimile.
-                neutral_extra = [None for _ in champion_cols]
-                abc_pred = _predict_full_abc_growth(
-                    full_abc_model, field_no, base_values, neutral_extra,
-                )
+                # Sama põld võib 9 päeva aknas tulla uuesti korjesse. Prognoositud eelkorjet
+                # ei kasutata järgmise korje biokoormuse sisendina.
+                abc_extra_values = [None for _ in champion_cols]
                 abc_mode = f"{champion_name} · koormus neutraalne"
             else:
-                abc_pred = _predict_full_abc_growth(
-                    full_abc_model, field_no, base_values,
-                    _champion_feature_values(state, wx),
-                )
+                abc_extra_values = _champion_feature_values(state, wx)
                 abc_mode = champion_name
+
+            abc_pred = _predict_full_abc_growth(
+                full_abc_model, field_no, base_values, abc_extra_values,
+            )
+            abc_explain = _abc_growth_explain(
+                full_abc_model, field_no, base_values, abc_extra_values, champion_cols,
+            )
             xl_pred = _predict_full_generic(
                 full_xl_model, field_no, base_values,
                 [state.get("xl"), state.get("xl_prev"), state.get("abc"), state.get("total")],
@@ -1586,6 +1674,7 @@ with tabs[3]:
             return {
                 "abc": abc_pred, "xl": xl_pred, "cb": cb_pred, "total": abc_pred + xl_pred,
                 "interval": wx["Intervall p"], "estimated_days": estimated_days or set(), "abc_mode": abc_mode,
+                "abc_explain": abc_explain, "wx": wx,
             }
 
         field_state = {}
@@ -1706,6 +1795,7 @@ with tabs[3]:
                     "Põld": f, "A+B+C": result["abc"], "C/B": result["cb"], "XL": result["xl"], "Kokku": result["total"],
                     "Intervall": result["interval"], "Alus": source_label,
                     "Hinnanguline ilm": ", ".join(sorted(d.strftime("%d.%m") for d in result["estimated_days"])) or "—",
+                    "_ABC_selgitus": result.get("abc_explain"), "_WX": result.get("wx"),
                 })
                 field_state[int(f)] = {
                     "date": target_day, "abc": result["abc"], "abc_prev": prev.get("abc"),
@@ -1724,7 +1814,7 @@ with tabs[3]:
         # Mudeliversioon tähistab champion-valiku raamistikku, mitte tänase võitja nime.
         # Nii uuendab sama päeva rerun sama operatiivset snapshot'i ka siis, kui champion
         # uue korje järel päeva jooksul muutub. Võitja nimi salvestub basis-väljale.
-        MODEL_VERSION = "v6.3-weather-load-champion-v5"
+        MODEL_VERSION = "v6.4-growth-potential-explain-v1"
         forecast_payloads = []
         for target_day, rows_day in forecast_days:
             for row in rows_day:
@@ -1779,13 +1869,65 @@ with tabs[3]:
                 st.markdown(f"### {_short_date(target_day)}  {total_text}")
                 st.caption(f"{lead} p ette · {confidence}")
             day_df = pd.DataFrame(rows_day)
-            st.dataframe(day_df.style.format({
+            visible_cols = [c for c in day_df.columns if not str(c).startswith("_")]
+            day_df_visible = day_df[visible_cols]
+            st.dataframe(day_df_visible.style.format({
                 "A+B+C": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
                 "C/B": lambda v: "—" if pd.isna(v) else f"{float(v):.2f}",
                 "XL": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
                 "Kokku": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
                 "Intervall": lambda v: "—" if pd.isna(v) else f"{int(v)} p",
             }), use_container_width=True, hide_index=True)
+
+            explain_rows = []
+            input_lines = []
+            for r in rows_day:
+                ex = r.get("_ABC_selgitus")
+                wxr = r.get("_WX") or {}
+                if not ex:
+                    continue
+                effects = ex.get("effects") or {}
+                erow = {
+                    "Põld": r.get("Põld"),
+                    "Mudelibaas": ex.get("baseline"),
+                    "Temperatuur": effects.get("Temperatuur", 0.0),
+                    "Radiatsioon": effects.get("Radiatsioon", 0.0),
+                    "Sademed": effects.get("Sademed", 0.0),
+                    "Niiskus": effects.get("Niiskus", 0.0),
+                    "ET0": effects.get("ET0", 0.0),
+                    "Tuul": effects.get("Tuul", 0.0),
+                    "Intervall": effects.get("Intervall", 0.0),
+                    "Hooaeg": effects.get("Hooaeg", 0.0),
+                    "Põlluefekt": effects.get("Põlluefekt", 0.0),
+                    "Biokoormus": effects.get("Biokoormus", 0.0),
+                    "A+B+C": ex.get("prediction"),
+                }
+                if abs(float(effects.get("Muu", 0.0) or 0.0)) >= 0.01:
+                    erow["Muu"] = effects.get("Muu", 0.0)
+                explain_rows.append(erow)
+                try:
+                    input_lines.append(
+                        f"põld {int(r.get('Põld'))}: T {float(wxr.get('T kesk')):.1f} °C · "
+                        f"rad {float(wxr.get('Radiatsioon Σ')):.1f} MJ/m² ({float(wxr.get('Radiatsioon/p')):.1f}/p) · "
+                        f"sade {float(wxr.get('Sademed Σ')):.1f} mm · RH {float(wxr.get('Niiskus kesk')):.0f}% · "
+                        f"ET0 {float(wxr.get('ET0 Σ')):.1f} mm · intervall {int(wxr.get('Intervall p'))} p"
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+            if explain_rows:
+                st.caption("A+B+C selgitus · +/− = teguri panus kastides võrreldes mudeli neutraalse treeningtasemega")
+                explain_df = pd.DataFrame(explain_rows)
+                effect_cols = [c for c in explain_df.columns if c not in {"Põld", "Mudelibaas", "A+B+C"}]
+                fmt = {
+                    "Mudelibaas": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
+                    "A+B+C": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
+                }
+                for c in effect_cols:
+                    fmt[c] = lambda v: "—" if pd.isna(v) else f"{float(v):+.1f}"
+                st.dataframe(explain_df.style.format(fmt), use_container_width=True, hide_index=True)
+                if input_lines:
+                    st.caption("Sisendid · " + "  |  ".join(input_lines))
 
         abc_mae_text = f"{current_test_mae:.1f} kasti/põld" if current_test_mae is not None else "veel hindamata"
         total_mae_text = f"{current_total_test_mae:.1f} kasti/põld" if current_total_test_mae is not None else "veel hindamata"
