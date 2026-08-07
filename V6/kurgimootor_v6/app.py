@@ -1,4 +1,5 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 import math
 
@@ -12,7 +13,7 @@ import streamlit.components.v1 as components
 import db
 from core import WeatherService
 
-TODAY = date.today()
+TODAY = datetime.now(ZoneInfo("Europe/Tallinn")).date()
 APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "kurgimootor_icon.png"
 APP_ICON = Image.open(APP_ICON_PATH)
 st.set_page_config(page_title="KurgiMootor V6.4", page_icon=APP_ICON, layout="wide")
