@@ -673,11 +673,12 @@ with tabs[3]:
     for _field_no, _rows in rows_by_field.items():
         _abc_hist = []
         _peak_hist = []
-        for _row in sorted(_rows, key=lambda r: str(r.get("harvest_date") or "")):
+        # rows_by_field sisaldab (harvest_day, row) paare ja on juba kuupäeva järgi sorteeritud.
+        # Ära käsitle paari dict-ina: biokoormuse arvutus kasutab päris harvest-rida.
+        for _d, _row in _rows:
             try:
-                _d = date.fromisoformat(str(_row.get("harvest_date")))
                 _a = float(_row.get("a")); _b = float(_row.get("b")); _c = float(_row.get("c"))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, AttributeError):
                 continue
             _quality = str(_row.get("data_quality") or "").strip().lower()
             if _quality in {"hinnanguline", "ligikaudne"}:
