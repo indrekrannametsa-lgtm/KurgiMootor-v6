@@ -141,15 +141,34 @@ def _render_day_block(day_label, rows, show_quality=False, planned_fields=None):
     )
 
     df, missing_rows = _field_table(rows, planned_fields=planned_fields)
+    def _format_field_value(value, digits=1):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return "—"
+        try:
+            return _fmt(float(value), digits)
+        except (TypeError, ValueError):
+            return str(value)
+
+    formatters = {
+        "A": lambda v: _format_field_value(v, 1),
+        "B": lambda v: _format_field_value(v, 1),
+        "C": lambda v: _format_field_value(v, 1),
+        "XL": lambda v: _format_field_value(v, 1),
+        "Kokku": lambda v: _format_field_value(v, 1),
+        "C/B": lambda v: _format_field_value(v, 2),
+    }
+    styled = df.style.format(formatters)
+
     if missing_rows:
         def _highlight_missing(row):
             if row.name in missing_rows:
                 return ["background-color: rgba(255, 193, 7, 0.28)" for _ in row]
             return ["" for _ in row]
-        st.dataframe(df.style.apply(_highlight_missing, axis=1), use_container_width=True, hide_index=True)
+        styled = styled.apply(_highlight_missing, axis=1)
+        st.dataframe(styled, use_container_width=True, hide_index=True)
         st.caption("Kollane = tänase põllu korjeandmed on veel puudu.")
     else:
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
     if show_quality:
         notes = []
@@ -211,10 +230,10 @@ with tabs[1]:
             key=f"manual_harvest_order_{form_version}",
         )
         q1, q2, q3, q4 = st.columns(4)
-        entry_a = q1.number_input("A", 0.0, step=0.1, key=f"manual_a_{form_version}")
-        entry_b = q2.number_input("B", 0.0, step=0.1, key=f"manual_b_{form_version}")
-        entry_c = q3.number_input("C", 0.0, step=0.1, key=f"manual_c_{form_version}")
-        entry_xl = q4.number_input("XL", 0.0, step=0.1, key=f"manual_xl_{form_version}")
+        entry_a = q1.number_input("A", 0.0, step=0.1, format="%.1f", key=f"manual_a_{form_version}")
+        entry_b = q2.number_input("B", 0.0, step=0.1, format="%.1f", key=f"manual_b_{form_version}")
+        entry_c = q3.number_input("C", 0.0, step=0.1, format="%.1f", key=f"manual_c_{form_version}")
+        entry_xl = q4.number_input("XL", 0.0, step=0.1, format="%.1f", key=f"manual_xl_{form_version}")
         total_preview = entry_a + entry_b + entry_c + entry_xl
         cb_preview = entry_c / entry_b if entry_b > 0 else None
         preview_text = f"Kokku: {_fmt(total_preview)}"
@@ -288,7 +307,15 @@ with tabs[1]:
             })
             if not df.empty and "B" in df.columns and "C" in df.columns:
                 df["C/B"] = df.apply(lambda r: round(_n(r["C"]) / _n(r["B"]), 2) if _n(r["B"]) > 0 else None, axis=1)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            all_rows_formatters = {
+                "A": lambda v: _format_field_value(v, 1),
+                "B": lambda v: _format_field_value(v, 1),
+                "C": lambda v: _format_field_value(v, 1),
+                "XL": lambda v: _format_field_value(v, 1),
+                "Kokku": lambda v: _format_field_value(v, 1),
+                "C/B": lambda v: _format_field_value(v, 2),
+            }
+            st.dataframe(df.style.format(all_rows_formatters), use_container_width=True, hide_index=True)
     else:
         st.info("Korjeid pole veel sisestatud.")
 
