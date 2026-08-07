@@ -964,10 +964,14 @@ with tabs[3]:
             Xte = np.column_stack([np.ones(len(test_idx)), zte, te_missing, fte])
             return Xtr, Xte, means, scales, fills
 
-        def _ridge_walk_predict(target, extra_arrays, train_idx, test_idx, alpha=10.0, floor_zero=True):
+        def _ridge_walk_predict(target, extra_arrays, train_idx, test_idx, alpha=10.0, floor_zero=True, field_alpha=80.0):
             Xtr, Xte, _, _, _ = _build_ridge_design(train_idx, test_idx, extra_arrays)
             penalty = np.eye(Xtr.shape[1]) * alpha
             penalty[0, 0] = 0.0
+            # 14 viimast veergu on põllu one-hot tunnused. Õppimisandmestik on veel väike,
+            # seetõttu kasutame siin tugevat partial-pooling kahandamist: põllu eripära jääb
+            # alles, kuid ei tohi üksinda weather-first prognoosi nulli/äärmusse suruda.
+            penalty[-14:, -14:] = np.eye(14) * field_alpha
             beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ target[train_idx]
             values = Xte @ beta
             return np.maximum(values, 0.0) if floor_zero else values
@@ -1302,11 +1306,15 @@ with tabs[3]:
                     "Võidab ridu %": "{:.0f}%", "Halvim pool": "{:+.2f}",
                 }), use_container_width=True, hide_index=True)
 
-        def _fit_full_generic(target, extra_arrays, alpha=10.0):
+        def _fit_full_generic(target, extra_arrays, alpha=10.0, field_alpha=80.0):
             idx = np.where(np.isfinite(target))[0]
             Xtr, _, means, scales, fills = _build_ridge_design(idx, idx, extra_arrays)
             penalty = np.eye(Xtr.shape[1]) * alpha
             penalty[0, 0] = 0.0
+            # Partial pooling põldudele: 14 viimast koefitsienti saavad tugevama
+            # regulaaristuse kui ilma/hooaja tunnused. Nii ei õpi 2–3 korjerea põhjal
+            # mõne põllu jaoks kunstlikku suurt negatiivset/positiivset püsiefekti.
+            penalty[-14:, -14:] = np.eye(14) * field_alpha
             beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ target
             return {"beta": beta, "means": means, "scales": scales, "fills": fills, "n_extra": len(extra_arrays)}
 
@@ -1353,7 +1361,8 @@ with tabs[3]:
             f"hooaja faasil ja põllu identiteedil. Tõestatud normaliseeritud bioloogiline koormus võib baasi korrigeerida, "
             f"kuid toores eelmine saak, saagitrend ja muud korjeajaloo mälutunnused ei saa prognoosi ankurdada. "
             f"C/B kasutab eraldi championit: {cb_champion_name}. XL lisatakse eraldi korjejäägi komponendina. "
-            "Korjevahemiku möödunud päevadel kasutatakse mõõdetud ilma ja tulevastel päevadel 9 päeva ilmaprognoosi."
+            "Korjevahemiku möödunud päevadel kasutatakse mõõdetud ilma ja tulevastel päevadel 9 päeva ilmaprognoosi. "
+            "Põllu eripära on mudelis partial-pooling kujul: väikese põllupõhise valimi korral ei lasta põlluefektil ilma mõju üle sõita."
         )
         st.info(
             "Oluline: ajalooline walk-forward MAE mõõdab saagimudelit realiseerunud mõõdetud ilma peal. "
