@@ -7,6 +7,7 @@ from PIL import Image
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 import db
 from core import WeatherService
@@ -15,6 +16,55 @@ TODAY = date.today()
 APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "kurgimootor_icon.png"
 APP_ICON = Image.open(APP_ICON_PATH)
 st.set_page_config(page_title="KurgiMootor V6.4", page_icon=APP_ICON, layout="wide")
+
+# PWA / iOS Home Screen metadata. Streamlit does not expose <head> directly,
+# so a tiny same-origin component appends the standard tags to the parent page.
+components.html(
+    """
+    <script>
+    (() => {
+      const doc = window.parent.document;
+
+      function ensureLink(rel, href, attrs = {}) {
+        let el = doc.head.querySelector(`link[rel="${rel}"]`);
+        if (!el) {
+          el = doc.createElement("link");
+          el.rel = rel;
+          doc.head.appendChild(el);
+        }
+        el.href = href;
+        Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+      }
+
+      function ensureMeta(name, content, byProperty = false) {
+        const attr = byProperty ? "property" : "name";
+        let el = doc.head.querySelector(`meta[${attr}="${name}"]`);
+        if (!el) {
+          el = doc.createElement("meta");
+          el.setAttribute(attr, name);
+          doc.head.appendChild(el);
+        }
+        el.setAttribute("content", content);
+      }
+
+      ensureLink("manifest", "/app/static/manifest.webmanifest");
+      ensureLink("apple-touch-icon", "/app/static/apple-touch-icon.png", {"sizes": "180x180"});
+      ensureLink("icon", "/app/static/kurgimootor-192.png", {"type": "image/png", "sizes": "192x192"});
+
+      ensureMeta("theme-color", "#0b3b24");
+      ensureMeta("mobile-web-app-capable", "yes");
+      ensureMeta("apple-mobile-web-app-capable", "yes");
+      ensureMeta("apple-mobile-web-app-status-bar-style", "black-translucent");
+      ensureMeta("apple-mobile-web-app-title", "KurgiMootor");
+
+      doc.title = "KurgiMootor";
+    })();
+    </script>
+    """,
+    height=0,
+    width=0,
+)
+
 
 
 def _n(value) -> float:
@@ -269,7 +319,86 @@ with tabs[0]:
     today_rows = db.get_harvest_for_day(TODAY)
     harvest_history_for_plan = db.get_harvest_history()
     today_planned_fields = _planned_fields_for_day(TODAY, today_rows, harvest_history_for_plan)
-    _render_day_block(_short_date(TODAY), today_rows, planned_fields=today_planned_fields)
+
+    # Avaleht = tänane töö + tänane prognoos. Analüütilised detailid jäävad Prognoos-menüüsse.
+    home_left, home_right = st.columns([1.55, 1.0], gap="large")
+
+    with home_left:
+        st.markdown("#### Tänased põllud ja korje")
+        selected_today_fields = st.multiselect(
+            "Täna korjatavad põllud",
+            options=list(range(1, 15)),
+            default=today_planned_fields,
+            key="home_today_fields",
+            help="Vaikimisi 3 järjestikust põldu. Kui täna korjatakse ainult 2, eemalda kolmas.",
+        )
+        if len(selected_today_fields) > 3:
+            st.warning("Vali tänaseks kuni 3 põldu.")
+            selected_today_fields = selected_today_fields[:3]
+
+        today_by_field = {int(r.get("field_no")): r for r in today_rows if r.get("field_no") is not None}
+        for order_idx, field_no in enumerate(selected_today_fields, start=1):
+            existing = today_by_field.get(int(field_no), {})
+            with st.form(f"home_harvest_field_{field_no}", border=True):
+                st.markdown(f"**Põld {field_no}**")
+                a1, a2, a3, a4 = st.columns(4)
+                home_a = a1.number_input(
+                    "A", min_value=0.0, step=0.1, format="%.1f",
+                    value=float(existing.get("a") or 0.0), key=f"home_a_{field_no}"
+                )
+                home_b = a2.number_input(
+                    "B", min_value=0.0, step=0.1, format="%.1f",
+                    value=float(existing.get("b") or 0.0), key=f"home_b_{field_no}"
+                )
+                home_c = a3.number_input(
+                    "C", min_value=0.0, step=0.1, format="%.1f",
+                    value=float(existing.get("c") or 0.0), key=f"home_c_{field_no}"
+                )
+                home_xl = a4.number_input(
+                    "XL", min_value=0.0, step=0.1, format="%.1f",
+                    value=float(existing.get("xl") or 0.0), key=f"home_xl_{field_no}"
+                )
+                home_total = home_a + home_b + home_c + home_xl
+                home_cb = (home_c / home_b) if home_b > 0 else None
+                home_summary = f"Kokku {_fmt(home_total)}"
+                if home_cb is not None:
+                    home_summary += f" · C/B {_fmt(home_cb, 2)}"
+                st.caption(home_summary)
+
+                button_label = "Paranda" if existing else "Salvesta"
+                if st.form_submit_button(button_label, use_container_width=True):
+                    if home_total <= 0:
+                        st.warning("Korje kogus on 0.")
+                    else:
+                        db.save_harvest(
+                            TODAY, int(field_no), 0,
+                            home_a, home_b, home_c, home_xl,
+                            harvest_order=order_idx,
+                        )
+                        st.session_state["harvest_saved_message"] = (
+                            f"Salvestatud: põld {field_no} · kokku {_fmt(home_total)}"
+                        )
+                        st.rerun()
+
+        if not selected_today_fields:
+            st.info("Vali vähemalt üks tänane põld.")
+
+        live_rows = [r for r in today_rows if int(r.get("field_no") or 0) in set(selected_today_fields)]
+        if live_rows:
+            actual = _daily_summary(live_rows)
+            actual_cb = "—" if actual["cb"] is None else _fmt(actual["cb"], 2)
+            st.markdown(
+                f"**Tegelik seni: {_fmt(actual['total'])} kasti**  "
+                f"· A {_fmt(actual['a'])} · B {_fmt(actual['b'])} · C {_fmt(actual['c'])} "
+                f"· XL {_fmt(actual['xl'])} · C/B {actual_cb}"
+            )
+
+    with home_right:
+        home_today_forecast_slot = st.empty()
+
+    st.divider()
+    st.markdown("#### Järgmised päevad")
+    home_future_forecast_slot = st.empty()
 
 with tabs[1]:
     st.subheader("Korjed")
@@ -1983,7 +2112,7 @@ with tabs[3]:
                 total_value = float(row.get("total"))
             except (TypeError, ValueError):
                 continue
-            if d <= TODAY:
+            if d < TODAY:
                 quality = str(row.get("data_quality") or "").strip().lower()
                 old = field_state.get(f)
                 abc_value = a + b + c
@@ -2012,8 +2141,39 @@ with tabs[3]:
                     peak_hist.append(peak)
 
         today_rows_live = db.get_harvest_for_day(TODAY)
-        today_plan = _planned_fields_for_day(TODAY, today_rows_live, harvest_rows)
+        today_plan_default = _planned_fields_for_day(TODAY, today_rows_live, harvest_rows)
+
+        # Avalehel võib kasutaja tänase 3 põllu valikust ühe eemaldada.
+        # Kui sessionis pole valikut, kasutame automaatset plaani.
+        selected_home = st.session_state.get("home_today_fields")
+        if selected_home:
+            today_plan = [int(f) for f in selected_home[:3]]
+        else:
+            today_plan = [int(f) for f in today_plan_default]
+
         today_actual = {int(r.get("field_no")): r for r in today_rows_live if r.get("field_no") is not None}
+
+        # Tänane prognoos arvutatakse kõigile valitud põldudele ENNE tänaste
+        # tegelike ridade rakendamist. Nii saab avalehel võrrelda prognoosi ja tegelikku.
+        today_forecast_rows = []
+        today_predictions_by_field = {}
+        for f in today_plan:
+            prev = field_state.get(int(f))
+            if not prev:
+                continue
+            pred = _predict_one(int(f), prev, TODAY)
+            if not pred:
+                continue
+            today_predictions_by_field[int(f)] = pred
+            today_forecast_rows.append({
+                "Põld": int(f),
+                "A+B+C": pred["abc"],
+                "C/B": pred["cb"],
+                "XL": pred["xl"],
+                "Kokku": pred["total"],
+                "Intervall": pred["interval"],
+                "Hinnanguline ilm": ", ".join(sorted(d.strftime("%d.%m") for d in pred["estimated_days"])) or "—",
+            })
 
         internal_today = []
         for f in today_plan:
@@ -2021,10 +2181,6 @@ with tabs[3]:
             if actual:
                 try:
                     old = field_state.get(int(f))
-                    # harvest_rows sisaldab tavaliselt juba tänast salvestatud rida; ära lisa
-                    # sama tegelikku korjet koormusajalukku teist korda.
-                    if old and old.get("date") == TODAY and old.get("source") == "tegelik":
-                        continue
                     a=float(actual.get("a")); b=float(actual.get("b")); c=float(actual.get("c")); xl=float(actual.get("xl")); total=float(actual.get("total"))
                     abc_value = a + b + c
                     hist = field_actual_abc_hist.setdefault(int(f), [])
@@ -2049,21 +2205,21 @@ with tabs[3]:
                     continue
                 except (TypeError, ValueError):
                     pass
+
             prev = field_state.get(int(f))
-            if not prev:
+            pred = today_predictions_by_field.get(int(f))
+            if not prev or not pred:
                 continue
-            nowcast = _predict_one(int(f), prev, TODAY)
-            if nowcast:
-                field_state[int(f)] = {
-                    "date": TODAY, "abc": nowcast["abc"], "abc_prev": prev.get("abc"),
-                    "xl": nowcast["xl"], "xl_prev": prev.get("xl"),
-                    "cb": nowcast["cb"], "cb_prev": prev.get("cb"),
-                    "total": nowcast["total"], "total_prev": prev.get("total"),
-                    "load_index": None, "overload": None, "load2_index": None,
-                    "peak": None, "peak_prev": prev.get("peak"),
-                    "source": "prognoos",
-                }
-                internal_today.append((int(f), nowcast["total"]))
+            field_state[int(f)] = {
+                "date": TODAY, "abc": pred["abc"], "abc_prev": prev.get("abc"),
+                "xl": pred["xl"], "xl_prev": prev.get("xl"),
+                "cb": pred["cb"], "cb_prev": prev.get("cb"),
+                "total": pred["total"], "total_prev": prev.get("total"),
+                "load_index": None, "overload": None, "load2_index": None,
+                "peak": None, "peak_prev": prev.get("peak"),
+                "source": "prognoos",
+            }
+            internal_today.append((int(f), pred["total"]))
 
         forecast_days = []
         first_field = _next_field(today_plan[-1]) if today_plan else 1
@@ -2139,6 +2295,67 @@ with tabs[3]:
                 st.warning("Prognoosid arvutatakse, kuid neid ei salvestata veel: Supabase'is puudub yield_forecasts tabel. Käivita ZIP-is olev supabase_yield_forecasts.sql üks kord.")
         except db.DatabaseError as exc:
             st.warning(f"Prognoosid arvutatakse, kuid ajaloo salvestamine ebaõnnestus: {exc}")
+
+        # --- Avalehe kiire ülevaade ---
+        # Kuvame ainult tööks vajaliku: tänase valitud põldude summa ja päevakoondid.
+        try:
+            today_vals = [r for r in today_forecast_rows if r.get("Kokku") is not None]
+            if today_vals:
+                today_total_fc = sum(float(r["Kokku"]) for r in today_vals)
+                today_abc_fc = sum(float(r["A+B+C"]) for r in today_vals if r.get("A+B+C") is not None)
+                today_xl_fc = sum(float(r["XL"]) for r in today_vals if r.get("XL") is not None)
+                today_cb_vals = [float(r["C/B"]) for r in today_vals if r.get("C/B") is not None]
+                today_cb_fc = float(np.mean(today_cb_vals)) if today_cb_vals else None
+                cb_fc_text = "—" if today_cb_fc is None else _fmt(today_cb_fc, 2)
+                with home_today_forecast_slot.container():
+                    st.markdown("#### Tänane prognoos")
+                    st.metric(
+                        f"Põllud {' · '.join(str(f) for f in today_plan)}",
+                        f"{_fmt(today_total_fc)} kasti",
+                    )
+                    st.caption(
+                        f"A+B+C {_fmt(today_abc_fc)} · XL {_fmt(today_xl_fc)} · C/B ~{cb_fc_text}"
+                    )
+                    st.caption("Prognoos on lukustatud enne tänaste tegelike korjeridade rakendamist.")
+            else:
+                with home_today_forecast_slot.container():
+                    st.markdown("#### Tänane prognoos")
+                    st.info("Tänast prognoosi ei saanud veel moodustada.")
+
+            with home_future_forecast_slot.container():
+                for target_day, rows_day in forecast_days:
+                    valid = [r for r in rows_day if r.get("Kokku") is not None]
+                    if len(valid) != 3:
+                        continue
+                    total_day = sum(float(r["Kokku"]) for r in valid)
+                    abc_day = sum(float(r["A+B+C"]) for r in valid if r.get("A+B+C") is not None)
+                    xl_day = sum(float(r["XL"]) for r in valid if r.get("XL") is not None)
+                    cb_vals = [float(r["C/B"]) for r in valid if r.get("C/B") is not None]
+                    cb_day = float(np.mean(cb_vals)) if cb_vals else None
+                    cb_text = "—" if cb_day is None else _fmt(cb_day, 2)
+                    lead = (target_day - TODAY).days
+                    trend = lead >= 6
+                    bg = "#fff3cd" if trend else "rgba(0,0,0,0.025)"
+                    border = "#ffe69c" if trend else "rgba(128,128,128,0.20)"
+                    badge = f" · 🟡 trend {lead} p" if trend else ""
+                    st.markdown(
+                        f"""
+                        <div style="background:{bg};border:1px solid {border};border-radius:10px;
+                                    padding:10px 12px;margin:7px 0;">
+                          <div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline;">
+                            <strong style="font-size:1.05rem;">{_short_date(target_day)}</strong>
+                            <strong style="font-size:1.15rem;">{_fmt(total_day)} kasti{badge}</strong>
+                          </div>
+                          <div style="font-size:0.90rem;opacity:0.78;margin-top:3px;">
+                            A+B+C {_fmt(abc_day)} · XL {_fmt(xl_day)} · C/B ~{cb_text}
+                          </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+        except Exception as exc:
+            with home_today_forecast_slot.container():
+                st.caption(f"Avalehe prognoosivaade ei laadunud: {exc}")
 
         if internal_today:
             st.caption("Tänase poolelioleva korje sisemine tööprognoos: " + ", ".join(f"põld {f} ≈ {p:.1f}" for f,p in internal_today) + ". Tegelik kirje asendab selle automaatselt.")
