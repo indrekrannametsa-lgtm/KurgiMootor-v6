@@ -45,9 +45,60 @@ def _daily_summary(rows):
     }
 
 
-def _field_table(rows):
+def _next_field(field_no: int) -> int:
+    return 1 if field_no >= 14 else field_no + 1
+
+
+def _planned_fields_for_day(day: date, today_rows, history_rows):
+    # Kui tänasest on vähemalt üks õige korje sisestatud, kasutame päeva esimese
+    # korje põldu ploki algusena. Nii jääb plaan kooskõlla päriselt sisestatud andmetega.
+    ordered_today = sorted(today_rows, key=lambda r: int(r.get("harvest_order") or 99))
+    if ordered_today:
+        first = int(ordered_today[0].get("field_no"))
+        return [first, _next_field(first), _next_field(_next_field(first))]
+
+    # Muidu võtame viimase varasema päeva viimase korjepõllu ja liigume sealt edasi.
+    previous = []
+    for r in history_rows:
+        try:
+            rday = date.fromisoformat(str(r.get("harvest_date")))
+        except (TypeError, ValueError):
+            continue
+        if rday < day:
+            previous.append(r)
+
+    if previous:
+        latest_day = max(date.fromisoformat(str(r.get("harvest_date"))) for r in previous)
+        latest_rows = [r for r in previous if str(r.get("harvest_date")) == latest_day.isoformat()]
+        latest_rows.sort(key=lambda r: int(r.get("harvest_order") or 99))
+        last_field = int(latest_rows[-1].get("field_no"))
+        first = _next_field(last_field)
+        return [first, _next_field(first), _next_field(_next_field(first))]
+
+    return [1, 2, 3]
+
+
+def _field_table(rows, planned_fields=None):
+    by_field = {int(r.get("field_no")): r for r in rows if r.get("field_no") is not None}
+    fields = planned_fields or [int(r.get("field_no")) for r in rows if r.get("field_no") is not None]
     table = []
-    for r in rows:
+    missing_rows = set()
+
+    for field_no in fields:
+        r = by_field.get(int(field_no))
+        if r is None:
+            missing_rows.add(len(table))
+            table.append({
+                "Põld": int(field_no),
+                "A": None,
+                "B": None,
+                "C": None,
+                "XL": None,
+                "Kokku": "Andmed puuduvad",
+                "C/B": None,
+            })
+            continue
+
         b = _n(r.get("b"))
         c = _n(r.get("c"))
         table.append({
@@ -59,10 +110,28 @@ def _field_table(rows):
             "Kokku": _n(r.get("total")),
             "C/B": round(c / b, 2) if b > 0 else None,
         })
-    return pd.DataFrame(table)
+
+    # Kui mingil põhjusel on sisestatud põld, mida plaanis polnud, näitame ka selle välja.
+    planned_set = {int(f) for f in fields}
+    for field_no, r in by_field.items():
+        if field_no in planned_set:
+            continue
+        b = _n(r.get("b"))
+        c = _n(r.get("c"))
+        table.append({
+            "Põld": field_no,
+            "A": _n(r.get("a")),
+            "B": b,
+            "C": c,
+            "XL": _n(r.get("xl")),
+            "Kokku": _n(r.get("total")),
+            "C/B": round(c / b, 2) if b > 0 else None,
+        })
+
+    return pd.DataFrame(table), missing_rows
 
 
-def _render_day_block(day_label, rows, show_quality=False):
+def _render_day_block(day_label, rows, show_quality=False, planned_fields=None):
     s = _daily_summary(rows)
     cb_text = "—" if s["cb"] is None else _fmt(s["cb"], 2)
     st.markdown(f"### {day_label}\u2003\u2003{_fmt(s['total'])} kasti")
@@ -71,8 +140,16 @@ def _render_day_block(day_label, rows, show_quality=False):
         f"XL {_fmt(s['xl'])} · C/B {cb_text} · {s['count']}/3 põldu"
     )
 
-    df = _field_table(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    df, missing_rows = _field_table(rows, planned_fields=planned_fields)
+    if missing_rows:
+        def _highlight_missing(row):
+            if row.name in missing_rows:
+                return ["background-color: rgba(255, 193, 7, 0.28)" for _ in row]
+            return ["" for _ in row]
+        st.dataframe(df.style.apply(_highlight_missing, axis=1), use_container_width=True, hide_index=True)
+        st.caption("Kollane = tänase põllu korjeandmed on veel puudu.")
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
     if show_quality:
         notes = []
@@ -100,10 +177,9 @@ tabs = st.tabs(["Täna", "Korjed", "Ilm", "Prognoos", "Mootori tähelepanekud"])
 with tabs[0]:
     st.subheader("Täna")
     today_rows = db.get_harvest_for_day(TODAY)
-    if today_rows:
-        _render_day_block(_short_date(TODAY), today_rows)
-    else:
-        st.info("Tänaseid korjeid pole veel sisestatud. Ava ülevalt „Korjed“ ja sisesta põldude korjed.")
+    harvest_history_for_plan = db.get_harvest_history()
+    today_planned_fields = _planned_fields_for_day(TODAY, today_rows, harvest_history_for_plan)
+    _render_day_block(_short_date(TODAY), today_rows, planned_fields=today_planned_fields)
 
 with tabs[1]:
     st.subheader("Korjed")
@@ -183,10 +259,17 @@ with tabs[1]:
 
         for day_str, day_rows in by_day.items():
             try:
-                day_label = _short_date(date.fromisoformat(day_str))
+                day_date = date.fromisoformat(day_str)
+                day_label = _short_date(day_date)
             except ValueError:
+                day_date = None
                 day_label = day_str
-            _render_day_block(day_label, day_rows, show_quality=True)
+
+            planned_fields = None
+            if day_date == TODAY:
+                planned_fields = _planned_fields_for_day(TODAY, day_rows, rows)
+
+            _render_day_block(day_label, day_rows, show_quality=True, planned_fields=planned_fields)
             st.divider()
 
         with st.expander("Näita kõiki korjeridu ühe tabelina"):
