@@ -894,10 +894,10 @@ with tabs[3]:
             mime="text/csv",
         )
 
-        st.markdown("##### A+B+C põhimudel + eraldi XL-komponent")
+        st.markdown("##### A+B+C kasvupotentsiaali mudel + eraldi XL-komponent")
         st.caption(
-            "Põhimudel ennustab ainult A+B+C saaki, mis on taime tootmise objektiivsem osa. "
-            "Baasmudel kasutab ilma, korjeintervalli, hooaja faasi ja põllu identiteeti; eelmine saak ei ole kohustuslik sisend. "
+            "Põhimudel ennustab ainult A+B+C saaki positiivsel kasvupotentsiaali skaalal. "
+            "Baasmudel kasutab ilma, korjeintervalli, hooaja faasi ja põllu identiteeti; eelmine saak ei ole prognoosi ankur. "
             "XL prognoositakse eraldi mürasema korjejäägi komponendina. Mõlemat hinnatakse ajaliselt ausa walk-forward testiga."
         )
 
@@ -917,6 +917,14 @@ with tabs[3]:
         X_base = model_df[base_cont_cols].astype(float).to_numpy()
 
         y_abc = pd.to_numeric(model_df["ABC saak"], errors="coerce").to_numpy(dtype=float)
+        # V6.4: A+B+C operatiivne mudel õpib multiplikatiivsel positiivsel kasvupotentsiaali skaalal.
+        # EPS on ainult log(0) numbriline kaitse, mitte bioloogiline saagipõrand.
+        ABC_LOG_EPS = 0.05
+        log_y_abc = np.where(
+            np.isfinite(y_abc) & (y_abc >= 0),
+            np.log(np.maximum(y_abc, ABC_LOG_EPS)),
+            np.nan,
+        )
         y_xl = pd.to_numeric(model_df["XL"], errors="coerce").to_numpy(dtype=float)
         y_total = pd.to_numeric(model_df["Saak"], errors="coerce").to_numpy(dtype=float)
         y_cb = pd.to_numeric(model_df["C/B siht"], errors="coerce").to_numpy(dtype=float)
@@ -976,6 +984,30 @@ with tabs[3]:
             values = Xte @ beta
             return np.maximum(values, 0.0) if floor_zero else values
 
+        def _abc_growth_walk_predict(extra_arrays, train_idx, test_idx, alpha=10.0, field_alpha=80.0, z_clip=2.5):
+            """V6.4 A+B+C: multiplicative/positive growth-potential model.
+
+            Õpib log(A+B+C) multiplikatiivsel skaalal. Ilma ja muude pidevate tunnuste z-skoorid
+            piiratakse treeningu mõistlikku vahemikku, et 6–9 päeva prognoosi
+            ekstreemne ilm ei saaks lineaarset latentset mudelit absurdselt ekstrapoleerida.
+            """
+            valid_train = train_idx[np.isfinite(log_y_abc[train_idx])]
+            if len(valid_train) < min_train_rows:
+                return np.full(len(test_idx), np.nan, dtype=float)
+            Xtr, Xte, _, _, _ = _build_ridge_design(valid_train, test_idx, extra_arrays)
+            n_numeric = X_base.shape[1] + len(extra_arrays)
+            # intercept on veerg 0; sellele järgnevad standardiseeritud arvulised tunnused
+            Xtr[:, 1:1+n_numeric] = np.clip(Xtr[:, 1:1+n_numeric], -z_clip, z_clip)
+            Xte[:, 1:1+n_numeric] = np.clip(Xte[:, 1:1+n_numeric], -z_clip, z_clip)
+            penalty = np.eye(Xtr.shape[1]) * alpha
+            penalty[0, 0] = 0.0
+            penalty[-14:, -14:] = np.eye(14) * field_alpha
+            beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ log_y_abc[valid_train]
+            latent = Xte @ beta
+            # exp() teeb mudeli multiplikatiivseks ja positiivseks. Väga halb ilm võib
+            # viia prognoosi väga madalale, kuid mitte lineaarse algebra tõttu negatiivseks.
+            return np.exp(np.clip(latent, np.log(ABC_LOG_EPS), 6.0))
+
         min_train_rows = 10
         abc_predictions = np.full(len(model_df), np.nan, dtype=float)
         xl_predictions = np.full(len(model_df), np.nan, dtype=float)
@@ -986,7 +1018,7 @@ with tabs[3]:
                 continue
             # A+B+C BAASMudel: ainult ilm + intervall + hooajapäev + põllu identiteet.
             # Eelmist saaki siin tahtlikult EI kasutata.
-            abc_predictions[test_idx] = _ridge_walk_predict(y_abc, [], train_idx, test_idx)
+            abc_predictions[test_idx] = _abc_growth_walk_predict([], train_idx, test_idx)
             # XL-mudel saab kasutada varasemaid XL-e ning eelmise korje ABC/kogusaaki.
             xl_predictions[test_idx] = _ridge_walk_predict(
                 y_xl, [raw_xl1, raw_xl2, raw_prev_abc, raw_prev_total], train_idx, test_idx
@@ -1116,7 +1148,7 @@ with tabs[3]:
                 # Kandidaat saab ainult need lisatunnused, mis tema grupis on nimetatud.
                 # Eelmist saaki ei lisata enam vaikimisi ühelegi kandidaadile.
                 extra_arrays = [raw_extra[:, j] for j in range(raw_extra.shape[1])]
-                preds[test_idx] = _ridge_walk_predict(y, extra_arrays, train_idx, test_idx)
+                preds[test_idx] = _abc_growth_walk_predict(extra_arrays, train_idx, test_idx)
             return preds
 
         def _stability_stats(candidate_pred):
@@ -1337,11 +1369,49 @@ with tabs[3]:
             value = float((Xp @ model["beta"])[0])
             return max(0.0, value) if floor_zero else value
 
+        def _fit_full_abc_growth(extra_arrays, alpha=10.0, field_alpha=80.0, z_clip=2.5):
+            idx = np.where(np.isfinite(log_y_abc))[0]
+            Xtr, _, means, scales, fills = _build_ridge_design(idx, idx, extra_arrays)
+            n_numeric = X_base.shape[1] + len(extra_arrays)
+            Xtr[:, 1:1+n_numeric] = np.clip(Xtr[:, 1:1+n_numeric], -z_clip, z_clip)
+            penalty = np.eye(Xtr.shape[1]) * alpha
+            penalty[0, 0] = 0.0
+            penalty[-14:, -14:] = np.eye(14) * field_alpha
+            beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ log_y_abc[idx]
+            return {
+                "beta": beta, "means": means, "scales": scales, "fills": fills,
+                "n_extra": len(extra_arrays), "z_clip": z_clip,
+            }
+
+        def _predict_full_abc_growth(model, field_no, base_values, extra_values):
+            x = list(base_values)
+            miss = []
+            for i, value in enumerate(extra_values):
+                try:
+                    finite_value = value is not None and np.isfinite(float(value))
+                except (TypeError, ValueError):
+                    finite_value = False
+                if not finite_value:
+                    x.append(model["fills"][i])
+                    miss.append(1.0)
+                else:
+                    x.append(float(value))
+                    miss.append(0.0)
+            x = np.array([x], dtype=float)
+            z = (x - model["means"]) / model["scales"]
+            z = np.clip(z, -model.get("z_clip", 2.5), model.get("z_clip", 2.5))
+            onehot = np.zeros((1, 14), dtype=float)
+            if 1 <= int(field_no) <= 14:
+                onehot[0, int(field_no) - 1] = 1.0
+            Xp = np.column_stack([np.ones(1), z, np.array([miss], dtype=float), onehot])
+            latent = float((Xp @ model["beta"])[0])
+            return float(np.exp(np.clip(latent, np.log(ABC_LOG_EPS), 6.0)))
+
         champion_extra_arrays = [
             pd.to_numeric(model_df[c], errors="coerce").to_numpy(dtype=float) for c in champion_cols
         ]
-        full_abc_base_model = _fit_full_generic(y_abc, [])
-        full_abc_model = _fit_full_generic(y_abc, champion_extra_arrays)
+        full_abc_base_model = _fit_full_abc_growth([])
+        full_abc_model = _fit_full_abc_growth(champion_extra_arrays)
         biological_load_feature_names = {
             c for cols in biological_load_candidate_groups.values() for c in cols
         }
@@ -1493,12 +1563,12 @@ with tabs[3]:
                 # Hoidame sama championi weather-first osa ning neutraliseerime ainult teadmata
                 # bioloogilise koormuse lisatunnused mudeli enda keskmisele/missing-režiimile.
                 neutral_extra = [None for _ in champion_cols]
-                abc_pred = _predict_full_generic(
+                abc_pred = _predict_full_abc_growth(
                     full_abc_model, field_no, base_values, neutral_extra,
                 )
                 abc_mode = f"{champion_name} · koormus neutraalne"
             else:
-                abc_pred = _predict_full_generic(
+                abc_pred = _predict_full_abc_growth(
                     full_abc_model, field_no, base_values,
                     _champion_feature_values(state, wx),
                 )
