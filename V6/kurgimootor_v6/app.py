@@ -403,7 +403,244 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("Prognoos")
-    st.info("Saagiprognoosi mootor ühendatakse pärast täieliku ilmaandmestiku kontrolli.")
+    st.markdown("#### Andmete valmisolek")
+    st.caption(
+        "Kontrollime, kas ajaloolistest korjetest saab moodustada päris õppimisnäited: "
+        "sama põllu kahe järjestikuse korje vahel peab olema täielik mõõdetud ilm. "
+        "Tänane pooleliolev korjepäev ei blokeeri õppimist."
+    )
+
+    readiness_start = date(TODAY.year, 7, 1)
+    harvest_rows = db.get_harvest_history(limit=2000)
+
+    # Korjepäevad ja viimane täielik 3/3 päev. Pooleliolevat tänast päeva õppesse ei võeta.
+    harvest_by_day = {}
+    for row in harvest_rows:
+        day_str = str(row.get("harvest_date") or "")
+        if day_str:
+            harvest_by_day.setdefault(day_str, []).append(row)
+
+    complete_harvest_days = []
+    for day_str, day_rows in harvest_by_day.items():
+        fields = {int(r.get("field_no")) for r in day_rows if r.get("field_no") is not None}
+        if len(day_rows) == 3 and len(fields) == 3:
+            try:
+                complete_harvest_days.append(date.fromisoformat(day_str))
+            except ValueError:
+                pass
+
+    last_complete_harvest = max(complete_harvest_days) if complete_harvest_days else None
+    latest_harvest = None
+    valid_days = []
+    for day_str in harvest_by_day:
+        try:
+            valid_days.append(date.fromisoformat(day_str))
+        except ValueError:
+            pass
+    if valid_days:
+        latest_harvest = max(valid_days)
+
+    # Korjeridade baaskvaliteet.
+    harvest_problems = []
+    seen_keys = set()
+    represented_fields = set()
+    parsed_rows = []
+    for row in harvest_rows:
+        day_str = str(row.get("harvest_date") or "")
+        field_no = row.get("field_no")
+        try:
+            field_no_int = int(field_no)
+        except (TypeError, ValueError):
+            field_no_int = None
+        try:
+            harvest_day = date.fromisoformat(day_str) if day_str else None
+        except ValueError:
+            harvest_day = None
+
+        if field_no_int is not None:
+            represented_fields.add(field_no_int)
+
+        key = (day_str, field_no_int)
+        if key in seen_keys:
+            harvest_problems.append(f"Duplikaat: {day_str}, põld {field_no_int}")
+        seen_keys.add(key)
+
+        if harvest_day is None:
+            harvest_problems.append(f"Vigane või puuduv korjekuupäev: {day_str or '—'}")
+        if field_no_int is None or not 1 <= field_no_int <= 14:
+            harvest_problems.append(f"Vigane põld: {field_no}")
+        for field_name in ("a", "b", "c", "xl", "total"):
+            if row.get(field_name) is None:
+                harvest_problems.append(f"{day_str} põld {field_no}: {field_name.upper()} puudub")
+
+        if harvest_day is not None and field_no_int is not None:
+            parsed_rows.append((field_no_int, harvest_day, row))
+
+    missing_fields = [f for f in range(1, 15) if f not in represented_fields]
+
+    # Ilma baasnõue: 01.07 kuni viimase täieliku korjepäevani peab mõõdetud ilm olema 100% täielik.
+    weather_missing = []
+    weather_rows = []
+    weather_by_day = {}
+    required_weather = (
+        "temp_min_c", "temp_max_c", "wind_avg_ms", "radiation_mj_m2",
+        "humidity_avg_pct", "precipitation_mm", "et0_mm",
+    )
+    if last_complete_harvest and last_complete_harvest >= readiness_start:
+        weather_missing = db.get_incomplete_measured_dates(readiness_start, last_complete_harvest)
+        weather_rows = db.get_weather_rows(readiness_start, last_complete_harvest)
+        for wr in weather_rows:
+            if wr.get("data_kind") == "measured":
+                weather_by_day[str(wr.get("weather_date"))] = wr
+
+    def _weather_day_ok(day_value: date) -> bool:
+        wr = weather_by_day.get(day_value.isoformat())
+        return bool(
+            wr
+            and wr.get("checked")
+            and all(wr.get(name) is not None for name in required_weather)
+        )
+
+    # Päris õppimisnäide = ühe põllu korje, millele eelneb sama põllu varasem korje.
+    # Ilmaaken on päev pärast eelmist korjet kuni jooksva korjepäevani (kaasa arvatud).
+    rows_by_field = {f: [] for f in range(1, 15)}
+    if last_complete_harvest:
+        for field_no, harvest_day, row in parsed_rows:
+            if harvest_day <= last_complete_harvest:
+                rows_by_field[field_no].append((harvest_day, row))
+    for field_no in rows_by_field:
+        rows_by_field[field_no].sort(key=lambda item: item[0])
+
+    usable_samples = []
+    incomplete_samples = []
+    first_harvest_rows = []
+    for field_no, items in rows_by_field.items():
+        for idx, (current_day, row) in enumerate(items):
+            if idx == 0:
+                first_harvest_rows.append((field_no, current_day))
+                continue
+            previous_day = items[idx - 1][0]
+            window_start = previous_day + timedelta(days=1)
+            window_end = current_day
+            expected_days = max(0, (window_end - window_start).days + 1)
+            missing_days = []
+            cursor = window_start
+            while cursor <= window_end:
+                if not _weather_day_ok(cursor):
+                    missing_days.append(cursor)
+                cursor += timedelta(days=1)
+
+            sample = {
+                "field_no": field_no,
+                "previous_day": previous_day,
+                "current_day": current_day,
+                "interval_days": (current_day - previous_day).days,
+                "weather_days": expected_days,
+                "missing_days": missing_days,
+            }
+            if missing_days:
+                incomplete_samples.append(sample)
+            else:
+                usable_samples.append(sample)
+
+    weather_ready = bool(last_complete_harvest) and not weather_missing
+    harvest_ready = bool(last_complete_harvest) and not harvest_problems and not missing_fields
+    sample_ready = bool(usable_samples) and not incomplete_samples
+    training_ready = weather_ready and harvest_ready and sample_ready
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Õppimisnäiteid", len(usable_samples))
+    m2.metric("Ilmaauguga näiteid", len(incomplete_samples))
+    m3.metric("Põlde esindatud", f"{len(represented_fields)}/14")
+    m4.metric("Õppe piir", last_complete_harvest.strftime("%d.%m") if last_complete_harvest else "—")
+
+    if training_ready:
+        st.success(
+            f"✅ Andmestik on õppimiseks tehniliselt valmis kuni {last_complete_harvest.strftime('%d.%m.%Y')}. "
+            f"Täieliku ilmavahemikuga õppimisnäiteid on {len(usable_samples)}."
+        )
+    else:
+        st.warning("Õppimisandmestik ei ole veel täielikult valmis. Allpool on näha, mis piirab õppimisnäiteid.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("##### Ilm")
+        if last_complete_harvest is None:
+            st.error("🔴 Täielikku 3/3 korjepäeva ei leitud.")
+        elif weather_ready:
+            days_count = (last_complete_harvest - readiness_start).days + 1
+            st.success(
+                f"🟢 Mõõdetud ilm 01.07–{last_complete_harvest.strftime('%d.%m')} on täielik: "
+                f"{days_count}/{days_count} päeva."
+            )
+        else:
+            expected = (last_complete_harvest - readiness_start).days + 1
+            ok_count = max(0, expected - len(weather_missing))
+            st.error(
+                f"🔴 Mõõdetud ilm 01.07–{last_complete_harvest.strftime('%d.%m')}: "
+                f"{ok_count}/{expected} päeva valmis."
+            )
+            if weather_missing:
+                missing_text = ", ".join(d.strftime("%d.%m") for d in weather_missing[:20])
+                if len(weather_missing) > 20:
+                    missing_text += f" … +{len(weather_missing) - 20}"
+                st.caption(f"Puudulikud päevad: {missing_text}")
+
+    with c2:
+        st.markdown("##### Korjed")
+        if harvest_ready:
+            st.success("🟢 Korjeread korras ja kõik 14 põldu on ajaloos esindatud.")
+        else:
+            if missing_fields:
+                st.error("🔴 Ajaloost puuduvad põllud: " + ", ".join(map(str, missing_fields)))
+            if harvest_problems:
+                st.error(f"🔴 Korjeandmetes leiti {len(harvest_problems)} probleemset välja/rida.")
+                with st.expander("Näita korjeandmete probleeme"):
+                    for problem in harvest_problems[:100]:
+                        st.write("• " + problem)
+
+    st.markdown("##### Õppimisnäited põldude kaupa")
+    st.caption(
+        "Esimene teadaolev korje igal põllul on lähtepunkt, mitte õppimisnäide. "
+        "Järgmise korje näide kasutab selle põllu kahe korje vahele jäävat ilma."
+    )
+
+    field_summary = []
+    for field_no in range(1, 15):
+        usable_n = sum(1 for s in usable_samples if s["field_no"] == field_no)
+        bad_n = sum(1 for s in incomplete_samples if s["field_no"] == field_no)
+        harvest_n = len(rows_by_field.get(field_no, []))
+        field_summary.append({
+            "Põld": field_no,
+            "Korjeid": harvest_n,
+            "Õppimisnäiteid": usable_n,
+            "Ilmaauguga": bad_n,
+        })
+    st.dataframe(pd.DataFrame(field_summary), use_container_width=True, hide_index=True)
+
+    if incomplete_samples:
+        with st.expander("Näita ilmaauguga õppimisnäiteid"):
+            for sample in incomplete_samples[:100]:
+                missing_text = ", ".join(d.strftime("%d.%m") for d in sample["missing_days"])
+                st.write(
+                    f"• Põld {sample['field_no']}: {sample['previous_day'].strftime('%d.%m')} → "
+                    f"{sample['current_day'].strftime('%d.%m')} — puuduv ilm: {missing_text}"
+                )
+
+    st.markdown("##### Mida mudel hiljem sellest kasutab")
+    st.write(
+        "Iga õppimisnäite siht on konkreetse põllu järgmine saak. Sisenditesse saab sellest ilmavahemikust "
+        "arvutada näiteks temperatuuri, radiatsiooni, sademete, õhuniiskuse ja ET0 summad/keskmised ning "
+        "korjeintervalli. Eelmise korje saak võib olla üks lisatunnus, kuid ei ole prognoosi põhialus."
+    )
+
+    if last_complete_harvest and latest_harvest and latest_harvest > last_complete_harvest:
+        st.caption(
+            "Uuem pooleliolev korjepäev jääb õppimisest ajutiselt välja, kuni päeva korjeplokk on täielik."
+        )
+
+    st.divider()
+    st.info("Järgmine samm pärast rohelist valmisolekut: ehitada nendest õppimisnäidetest esimene põllupõhine kogusaagi mudel.")
 
 with tabs[4]:
     st.subheader("Mootori tähelepanekud")
