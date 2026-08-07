@@ -1477,8 +1477,17 @@ with tabs[3]:
             # eelmine sama põllu korje on päriselt mõõdetud. Kui vahepealne eelkorje on
             # ise tulevikuprognoos, ei toida me mudelit tema enda väljundiga tagasi.
             if champion_uses_biological_load and state.get("source") != "tegelik":
-                abc_pred = _predict_full_generic(full_abc_base_model, field_no, base_values, [])
-                abc_mode = "weather-first fallback"
+                # Sama põld võib 9 päeva aknas tulla uuesti korjesse. Sellisel juhul ei tohi
+                # vahepealset PROGNOOSITUD saaki kasutada järgmise korje biokoormuse sisendina.
+                # Samas ei tohi ka hüpata eraldi treenitud baasmudelile, sest selle koefitsiendid
+                # võivad väikese andmestiku korral anda kunstliku mudelivahetuse (sh nulli kukkumise).
+                # Hoidame sama championi weather-first osa ning neutraliseerime ainult teadmata
+                # bioloogilise koormuse lisatunnused mudeli enda keskmisele/missing-režiimile.
+                neutral_extra = [None for _ in champion_cols]
+                abc_pred = _predict_full_generic(
+                    full_abc_model, field_no, base_values, neutral_extra,
+                )
+                abc_mode = f"{champion_name} · koormus neutraalne"
             else:
                 abc_pred = _predict_full_generic(
                     full_abc_model, field_no, base_values,
