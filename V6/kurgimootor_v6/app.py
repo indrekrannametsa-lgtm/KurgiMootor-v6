@@ -9,7 +9,7 @@ import db
 from core import WeatherService
 
 TODAY = date.today()
-st.set_page_config(page_title="KurgiMootor V6.3", page_icon="🥒", layout="wide")
+st.set_page_config(page_title="KurgiMootor V6.4", page_icon="🥒", layout="wide")
 
 
 def _n(value) -> float:
@@ -254,7 +254,7 @@ try:
 except Exception as exc:
     db.set_app_setting("weather_last_error", f"Automaatne ilmauuendus: {exc}")
 
-st.title("KurgiMootor V6.3")
+st.title("KurgiMootor V6.4")
 st.caption("Saagi ennustamise tööriist. Avaleht on töövoog, mitte ilmarakendus.")
 
 tabs = st.tabs(["Täna", "Korjed", "Ilm", "Prognoos", "Mootori tähelepanekud"])
