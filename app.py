@@ -1,336 +1,181 @@
-from __future__ import annotations
+from datetime import date, timedelta
 
-from datetime import date
-from typing import Dict, List
-
+import pandas as pd
 import streamlit as st
 
-from db import (
-    DatabaseError,
-    add_plan_field,
-    ensure_default_plan,
-    get_all_fields,
-    get_harvest_for_day,
-    get_plan_for_day,
-    get_used_interval,
-    remove_plan_field,
-    save_harvest,
-    get_weather_for_day,
-    get_weather_status,
-    save_weather,
-)
-
-st.set_page_config(
-    page_title="KurgiMootor V6.1",
-    page_icon="🥒",
-    layout="centered",
-)
-
-st.markdown(
-    """
-    <style>
-    .block-container {max-width: 900px; padding-top: 1.4rem;}
-    .field-row {
-        border: 1px solid rgba(128,128,128,.25);
-        border-radius: 12px;
-        padding: 14px 16px;
-        margin-bottom: 10px;
-    }
-    .field-name {font-size: 1.1rem; font-weight: 700;}
-    .interval {font-size: 1.55rem; font-weight: 800;}
-    .muted {opacity: .65;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+import db
+from core import WeatherService
 
 TODAY = date.today()
+st.set_page_config(page_title="KurgiMootor V6.2", page_icon="🥒", layout="wide")
 
-
-def optional_number(container, label: str, current, **kwargs):
-    value = None if current is None else float(current)
-    return container.number_input(label, value=value, **kwargs)
-
-
-def rerun() -> None:
-    st.rerun()
-
-
-def show_database_error(exc: Exception) -> None:
-    st.error(
-        "Ühendus ühise andmebaasiga ebaõnnestus. "
-        "Kontrolli Streamliti Secrets seadeid ja Supabase'i tabelite olemasolu."
-    )
-    st.code(str(exc))
-
-
-st.title("KurgiMootor V6.1")
-st.caption("Puhas tööversioon: põllud, tänane korjeplaan, intervallid ja korjete sisestamine.")
-
+# Ilm kontrollitakse automaatselt üks kord päevas. Viga ei takista korjete kasutamist.
 try:
-    ensure_default_plan(TODAY)
-    plan = get_plan_for_day(TODAY)
-    all_fields = get_all_fields()
-except DatabaseError as exc:
-    show_database_error(exc)
-    st.stop()
+    WeatherService().auto_refresh_if_needed(TODAY)
+except Exception as exc:
+    db.set_app_setting("weather_last_error", f"Automaatne ilmauuendus: {exc}")
 
-tab_today, tab_weather, tab_history = st.tabs(["Täna", "Ilmaandmed", "Korjeajalugu"])
+st.title("KurgiMootor V6.2")
+st.caption("Saagi ennustamise tööriist. Avaleht on töövoog, mitte ilmarakendus.")
 
-with tab_today:
-    st.subheader("Täna korjatavad põllud")
-    st.caption("Vaikimisi 3 põldu. Võid lisada, eemaldada või jätta päeva tühjaks.")
+tabs = st.tabs(["Täna", "Korjed", "Ilm", "Prognoos", "Mootori tähelepanekud"])
 
-    if not plan:
-        st.info("Täna ei ole ühtegi põldu korjeplaanis.")
+with tabs[0]:
+    st.subheader("Täna")
+    today_rows = db.get_harvest_for_day(TODAY)
+    if today_rows:
+        st.success(f"Täna on salvestatud {len(today_rows)} põllu korje.")
+        today_df = pd.DataFrame(today_rows).rename(columns={
+            "field_no": "Põld",
+            "harvest_order": "Järjekord",
+            "interval_days": "Intervall",
+            "a": "A",
+            "b": "B",
+            "c": "C",
+            "xl": "XL",
+            "total": "Kokku",
+        })
+        wanted = ["Põld", "Järjekord", "Intervall", "A", "B", "C", "XL", "Kokku"]
+        today_df = today_df[[c for c in wanted if c in today_df.columns]]
+        st.dataframe(today_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Tänaseid korjeid pole veel sisestatud. Ava ülevalt „Korjed“ ja sisesta põldude korjed.")
 
-    for row in plan:
-        field_id = int(row["field_id"])
-        field_name = str(row["field_name"])
-        interval = int(row["interval_days"])
+with tabs[1]:
+    st.subheader("Korjed")
+    st.caption("Korjeandmed salvestatakse Supabase'i harvests tabelisse. Üks rida = ühe põllu üks korje.")
 
-        col1, col2, col3 = st.columns([4, 2, 1.4])
-        with col1:
-            st.markdown(
-                f'<div class="field-row"><div class="field-name">{field_name}</div>'
-                '<div class="muted">Tänases korjeplaanis</div></div>',
-                unsafe_allow_html=True,
-            )
-        with col2:
-            st.markdown(
-                f'<div class="field-row"><div class="interval">{interval} p</div>'
-                '<div class="muted">korjeintervall</div></div>',
-                unsafe_allow_html=True,
-            )
-        with col3:
-            if st.button("Eemalda", key=f"remove_{field_id}", use_container_width=True):
-                try:
-                    remove_plan_field(TODAY, field_id)
-                    rerun()
-                except DatabaseError as exc:
-                    show_database_error(exc)
-
-    planned_ids = {int(row["field_id"]) for row in plan}
-    available = [f for f in all_fields if int(f["id"]) not in planned_ids]
-
-    if available:
-        label_to_id = {str(f["name"]): int(f["id"]) for f in available}
-        col_add1, col_add2 = st.columns([3, 1])
-        with col_add1:
-            chosen_name = st.selectbox(
-                "Lisa tänasesse plaani",
-                options=list(label_to_id.keys()),
-                label_visibility="collapsed",
-            )
-        with col_add2:
-            if st.button("Lisa põld", use_container_width=True):
-                try:
-                    add_plan_field(TODAY, label_to_id[chosen_name])
-                    rerun()
-                except DatabaseError as exc:
-                    show_database_error(exc)
+    st.markdown("#### Lisa või paranda korje")
+    with st.form("manual_harvest_form"):
+        c1, c2, c3 = st.columns(3)
+        entry_date = c1.date_input("Kuupäev", value=TODAY, key="manual_harvest_date")
+        entry_field = c2.selectbox("Põld", list(range(1, 15)), key="manual_harvest_field")
+        entry_order = c3.selectbox("Järjekord", [1, 2, 3], key="manual_harvest_order")
+        q1, q2, q3, q4 = st.columns(4)
+        entry_a = q1.number_input("A", 0.0, step=0.1, key="manual_a")
+        entry_b = q2.number_input("B", 0.0, step=0.1, key="manual_b")
+        entry_c = q3.number_input("C", 0.0, step=0.1, key="manual_c")
+        entry_xl = q4.number_input("XL", 0.0, step=0.1, key="manual_xl")
+        total_preview = entry_a + entry_b + entry_c + entry_xl
+        st.caption(f"Kokku: {total_preview:.1f}")
+        if st.form_submit_button("Salvesta korje"):
+            if total_preview <= 0:
+                st.warning("Korje kogus on 0. Sisesta vähemalt üks kogus.")
+            else:
+                db.save_harvest(entry_date, entry_field, 0, entry_a, entry_b, entry_c, entry_xl, harvest_order=entry_order)
+                st.success(f"Salvestatud: {entry_date} · põld {entry_field} · kokku {total_preview:.1f}")
+                st.rerun()
 
     st.divider()
-    st.subheader("Sisesta tänased korjed")
-
-    if plan:
-        existing_by_field: Dict[int, dict] = {}
-        try:
-            for row in get_harvest_for_day(TODAY):
-                existing_by_field[int(row["field_id"])] = row
-        except DatabaseError as exc:
-            show_database_error(exc)
-
-        with st.form("harvest_form", clear_on_submit=False):
-            values: Dict[int, List[float]] = {}
-
-            for row in plan:
-                field_id = int(row["field_id"])
-                field_name = str(row["field_name"])
-                existing = existing_by_field.get(field_id, {})
-
-                st.markdown(f"#### {field_name}")
-                c1, c2, c3, c4 = st.columns(4)
-                values[field_id] = [
-                    c1.number_input(
-                        "A",
-                        min_value=0.0,
-                        step=0.1,
-                        value=float(existing.get("a", 0.0)),
-                        key=f"a_{field_id}",
-                    ),
-                    c2.number_input(
-                        "B",
-                        min_value=0.0,
-                        step=0.1,
-                        value=float(existing.get("b", 0.0)),
-                        key=f"b_{field_id}",
-                    ),
-                    c3.number_input(
-                        "C",
-                        min_value=0.0,
-                        step=0.1,
-                        value=float(existing.get("c", 0.0)),
-                        key=f"c_{field_id}",
-                    ),
-                    c4.number_input(
-                        "XL",
-                        min_value=0.0,
-                        step=0.1,
-                        value=float(existing.get("xl", 0.0)),
-                        key=f"xl_{field_id}",
-                    ),
-                ]
-
-            submitted = st.form_submit_button("Salvesta korjed", use_container_width=True)
-
-        if submitted:
-            try:
-                saved = 0
-                for row in plan:
-                    field_id = int(row["field_id"])
-                    a, b, c_value, xl = values[field_id]
-                    if (a + b + c_value + xl) <= 0:
-                        continue
-
-                    used_interval = get_used_interval(TODAY, field_id)
-                    save_harvest(
-                        harvest_date=TODAY,
-                        field_id=field_id,
-                        interval_days=used_interval,
-                        a=a,
-                        b=b,
-                        c=c_value,
-                        xl=xl,
-                    )
-                    saved += 1
-
-                if saved:
-                    st.success(f"Salvestatud {saved} põllu korje.")
-                else:
-                    st.warning("Ühtegi positiivse kogusega korjet ei olnud salvestada.")
-            except DatabaseError as exc:
-                show_database_error(exc)
+    st.markdown("#### Korjeajalugu")
+    rows = db.get_harvest_history()
+    if rows:
+        df = pd.DataFrame(rows).rename(columns={
+            "harvest_date": "Kuupäev",
+            "field_no": "Põld",
+            "harvest_order": "Järjekord",
+            "interval_days": "Intervall",
+            "a": "A",
+            "b": "B",
+            "c": "C",
+            "xl": "XL",
+            "total": "Kokku",
+            "data_quality": "Andmekvaliteet",
+            "note": "Märkus",
+        })
+        st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        st.info("Korjete sisestamiseks lisa tänasesse plaani vähemalt üks põld.")
+        st.info("Korjeid pole veel sisestatud.")
 
+with tabs[2]:
+    st.subheader("Ilmaklots")
+    st.caption("Mõõdetud temperatuur, tuul, globaalradiatsioon, õhuniiskus ja sademed Pärnu jaamast. ET0 arvutatakse automaatselt.")
+    counts = db.get_weather_counts()
+    a, b, c = st.columns(3)
+    a.metric("Mõõdetud päevi", counts["measured"])
+    b.metric("Rohelisi päevi", counts["checked"])
+    c.metric("Prognoosipäevi", counts["forecast"])
+    st.caption(f"Viimane automaatne uuendus: {db.get_app_setting('weather_last_refresh_at', '—')}")
+    last_result = db.get_app_setting("weather_last_result", "")
+    if last_result:
+        st.caption(last_result)
+    error = db.get_app_setting("weather_last_error", "")
+    if error:
+        st.error(error)
+    if st.button("Uuenda ilm kohe"):
+        with st.spinner("Laen mõõteandmeid ja 9 päeva prognoosi..."):
+            result = WeatherService().safe_refresh_all(TODAY)
+        if result.get("error"):
+            st.warning(f"Uuendus tehti osaliselt: {result['error']}")
+        else:
+            st.success("Ilmaandmed uuendatud.")
+        st.rerun()
 
-with tab_weather:
-    st.subheader("Ilmaandmed")
-    st.caption(
-        "Häädemeeste jaam on põhiallikas. Globaalradiatsioon võetakse Pärnu jaamast. "
-        "Korjeandmed ei ole prognoosi avamise tingimus."
+    # Ilmaajalugu on äpis vabalt vaadeldav. Vaikimisi näitame kogu selle hooaja
+    # mõõdetud ajalugu alates 1. juulist; see valik mõjutab ainult vaadet, mitte
+    # mootorile salvestatud andmeid.
+    history_default_start = date(TODAY.year, 7, 1)
+    history_default_end = TODAY
+    st.subheader("Mõõdetud ilma ajalugu")
+    d1, d2 = st.columns(2)
+    history_start = d1.date_input(
+        "Alguskuupäev",
+        value=history_default_start,
+        max_value=TODAY,
+        key="weather_history_start",
     )
-
-    weather_day = st.date_input("Kuupäev", value=TODAY, key="weather_day")
-
-    try:
-        existing_weather = get_weather_for_day(weather_day) or {}
-        status = get_weather_status(weather_day)
-    except DatabaseError as exc:
-        show_database_error(exc)
-        existing_weather = {}
-        status = {"is_complete": False, "missing_fields": []}
-
-    if bool(status.get("is_complete")):
-        st.success("Ilmaandmed on prognoosi jaoks täielikud.")
+    history_end = d2.date_input(
+        "Lõppkuupäev",
+        value=history_default_end,
+        max_value=TODAY,
+        key="weather_history_end",
+    )
+    if history_start > history_end:
+        st.warning("Alguskuupäev peab olema lõppkuupäevast varasem.")
+        measured_rows = []
     else:
-        missing = status.get("missing_fields") or []
-        if missing:
-            st.warning("Prognoosi jaoks puudub: " + ", ".join(str(x) for x in missing))
-        else:
-            st.warning("Selle kuupäeva ilmaandmed pole veel sisestatud.")
+        history_rows = db.get_weather_rows(history_start, history_end)
+        measured_rows = [r for r in history_rows if r.get("data_kind") == "measured"][::-1]
 
-    with st.form("weather_form", clear_on_submit=False):
-        st.markdown("#### Häädemeeste ilmajaam")
-        c1, c2, c3 = st.columns(3)
-        temp_avg = optional_number(c1, "Keskmine temperatuur, °C", existing_weather.get("temp_avg_c"), step=0.1)
-        temp_min = optional_number(c2, "Miinimumtemperatuur, °C", existing_weather.get("temp_min_c"), step=0.1)
-        temp_max = optional_number(c3, "Maksimumtemperatuur, °C", existing_weather.get("temp_max_c"), step=0.1)
+    forecast_rows = [
+        r for r in db.get_weather_rows(TODAY, TODAY + timedelta(days=8))
+        if r.get("data_kind") == "forecast"
+    ]
 
-        c1, c2, c3 = st.columns(3)
-        humidity_avg = optional_number(c1, "Keskmine õhuniiskus, %", existing_weather.get("humidity_avg_pct"), min_value=0.0, max_value=100.0, step=0.1)
-        humidity_min = optional_number(c2, "Minimaalne õhuniiskus, %", existing_weather.get("humidity_min_pct"), min_value=0.0, max_value=100.0, step=0.1)
-        humidity_max = optional_number(c3, "Maksimaalne õhuniiskus, %", existing_weather.get("humidity_max_pct"), min_value=0.0, max_value=100.0, step=0.1)
+    st.caption(f"Kuvatakse {len(measured_rows)} mõõdetud päeva. Kõik salvestatud ilmaandmed jäävad mootorile kasutada sõltumata valitud vaatest.")
+    measured_display = [{
+        "Kuupäev": r["weather_date"],
+        "Min °C": r.get("temp_min_c"),
+        "Max °C": r.get("temp_max_c"),
+        "Tuul m/s": r.get("wind_avg_ms"),
+        "Niiskus %": r.get("humidity_avg_pct"),
+        "Sademed mm": r.get("precipitation_mm"),
+        "ET0 mm": r.get("et0_mm"),
+        "Radiatsioon MJ/m²": r.get("radiation_mj_m2"),
+        "Kontroll": r.get("check_message"),
+        "Olek": "🟢 Kontrollitud" if r.get("checked") else "🔴 Puudulik",
+    } for r in measured_rows]
+    st.dataframe(pd.DataFrame(measured_display), use_container_width=True, hide_index=True)
 
-        c1, c2 = st.columns(2)
-        precipitation = optional_number(c1, "Sademed, mm", existing_weather.get("precipitation_mm"), min_value=0.0, step=0.1)
-        dewpoint = optional_number(c2, "Keskmine kastepunkt, °C", existing_weather.get("dewpoint_avg_c"), step=0.1)
+    st.subheader("9 päeva prognoos")
+    forecast_display = [{
+        "Kuupäev": r["weather_date"],
+        "Min °C": r.get("temp_min_c"),
+        "Max °C": r.get("temp_max_c"),
+        "Tuul m/s": r.get("wind_avg_ms"),
+        "Niiskus %": r.get("humidity_avg_pct"),
+        "Sademed mm": r.get("precipitation_mm"),
+        "ET0 mm": r.get("et0_mm"),
+        "Radiatsioon MJ/m²": r.get("radiation_mj_m2"),
+        "Kontroll": r.get("check_message"),
+        "Olek": "🔵 Prognoos" if r.get("checked") else "🔴 Vigane prognoos",
+    } for r in forecast_rows]
+    st.dataframe(pd.DataFrame(forecast_display), use_container_width=True, hide_index=True)
 
-        st.markdown("#### Tuul")
-        c1, c2, c3, c4 = st.columns(4)
-        wind_avg = optional_number(c1, "Keskmine, m/s", existing_weather.get("wind_avg_ms"), min_value=0.0, step=0.1)
-        wind_max = optional_number(c2, "Maksimum, m/s", existing_weather.get("wind_max_ms"), min_value=0.0, step=0.1)
-        wind_gust = optional_number(c3, "Maks. puhang, m/s", existing_weather.get("wind_gust_ms"), min_value=0.0, step=0.1)
-        wind_direction = optional_number(c4, "Suund, °", existing_weather.get("wind_direction_deg"), min_value=0.0, max_value=360.0, step=1.0)
+with tabs[3]:
+    st.subheader("Prognoos")
+    st.info("Saagiprognoosi mootor ühendatakse pärast täieliku ilmaandmestiku kontrolli.")
 
-        st.markdown("#### Muud näitajad")
-        c1, c2 = st.columns(2)
-        pressure = optional_number(c1, "Keskmine õhurõhk, hPa", existing_weather.get("pressure_avg_hpa"), min_value=0.0, step=0.1)
-        sunshine = optional_number(c2, "Päikesepaiste kestus, h", existing_weather.get("sunshine_hours"), min_value=0.0, step=0.1)
-
-        st.markdown("#### Pärnu ilmajaam")
-        radiation = optional_number(st, "Globaalradiatsioon, MJ/m²", existing_weather.get("radiation_mj_m2"), min_value=0.0, step=0.01)
-        notes = st.text_area("Märkused", value=str(existing_weather.get("notes") or ""))
-
-        weather_submitted = st.form_submit_button("Salvesta ilmaandmed", use_container_width=True)
-
-    if weather_submitted:
-        try:
-            save_weather(
-                weather_day,
-                {
-                    "source_station": "Häädemeeste",
-                    "temp_avg_c": temp_avg,
-                    "temp_min_c": temp_min,
-                    "temp_max_c": temp_max,
-                    "humidity_avg_pct": humidity_avg,
-                    "humidity_min_pct": humidity_min,
-                    "humidity_max_pct": humidity_max,
-                    "precipitation_mm": precipitation,
-                    "wind_avg_ms": wind_avg,
-                    "wind_max_ms": wind_max,
-                    "wind_gust_ms": wind_gust,
-                    "wind_direction_deg": wind_direction,
-                    "pressure_avg_hpa": pressure,
-                    "dewpoint_avg_c": dewpoint,
-                    "sunshine_hours": sunshine,
-                    "radiation_mj_m2": radiation,
-                    "radiation_station": "Pärnu",
-                    "notes": notes.strip() or None,
-                },
-            )
-            st.success("Ilmaandmed salvestatud.")
-            rerun()
-        except DatabaseError as exc:
-            show_database_error(exc)
-
-
-with tab_history:
-    st.subheader("Korjeajalugu")
-    st.caption("Ajalugu on vaatamiseks ja mudeli õppimiseks. See ei blokeeri prognoosi.")
-
-    try:
-        from db import get_harvest_history
-
-        history = get_harvest_history(limit=300)
-        if not history:
-            st.info("Korjeid pole veel salvestatud.")
-        else:
-            table = []
-            for row in history:
-                table.append(
-                    {
-                        "Kuupäev": row["harvest_date"],
-                        "Põld": row["field_name"],
-                        "Intervall": row["interval_days"],
-                        "A": row["a"],
-                        "B": row["b"],
-                        "C": row["c"],
-                        "XL": row["xl"],
-                        "Kokku": row["total"],
-                    }
-                )
-            st.dataframe(table, use_container_width=True, hide_index=True)
-    except DatabaseError as exc:
-        show_database_error(exc)
+with tabs[4]:
+    st.subheader("Mootori tähelepanekud")
+    st.info("Mootor hakkab hiljem mustreid kuvama, kuid ei muuda mudelit ise.")

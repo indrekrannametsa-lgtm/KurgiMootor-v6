@@ -20,10 +20,8 @@ def _client() -> Client:
         raise DatabaseError(
             "Streamliti Secrets peab sisaldama [supabase] url ja secret_key."
         ) from exc
-
     if not url or not key:
         raise DatabaseError("Supabase URL või secret key puudub.")
-
     try:
         return create_client(url, key)
     except Exception as exc:
@@ -37,57 +35,22 @@ def _execute(query: Any) -> Any:
         raise DatabaseError(str(exc)) from exc
 
 
-def get_all_fields() -> List[Dict[str, Any]]:
-    response = _execute(_client().table("fields").select("id,name").order("id"))
-    return list(response.data or [])
-
-
-def get_plan_for_day(day: date) -> List[Dict[str, Any]]:
+def _previous_harvest_date(harvest_date: date, field_no: int) -> date | None:
     response = _execute(
-        _client()
-        .rpc("get_daily_plan", {"p_plan_date": day.isoformat()})
+        _client().table("harvests")
+        .select("harvest_date")
+        .eq("field_no", int(field_no))
+        .lt("harvest_date", harvest_date.isoformat())
+        .order("harvest_date", desc=True)
+        .limit(1)
     )
-    return list(response.data or [])
-
-
-def ensure_default_plan(day: date) -> None:
-    _execute(
-        _client()
-        .rpc("ensure_default_daily_plan", {"p_plan_date": day.isoformat()})
-    )
-
-
-def add_plan_field(day: date, field_id: int) -> None:
-    _execute(
-        _client()
-        .rpc(
-            "add_daily_plan_field",
-            {"p_plan_date": day.isoformat(), "p_field_id": int(field_id)},
-        )
-    )
-
-
-def remove_plan_field(day: date, field_id: int) -> None:
-    _execute(
-        _client()
-        .rpc(
-            "remove_daily_plan_field",
-            {"p_plan_date": day.isoformat(), "p_field_id": int(field_id)},
-        )
-    )
-
-
-def get_used_interval(day: date, field_id: int) -> int:
-    response = _execute(
-        _client()
-        .rpc(
-            "get_field_interval",
-            {"p_target_date": day.isoformat(), "p_field_id": int(field_id)},
-        )
-    )
-    if response.data is None:
-        raise DatabaseError("Korjeintervalli ei saadud arvutada.")
-    return int(response.data)
+    rows = list(response.data or [])
+    if not rows:
+        return None
+    try:
+        return date.fromisoformat(str(rows[0]["harvest_date"]))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def save_harvest(
@@ -98,71 +61,125 @@ def save_harvest(
     b: float,
     c: float,
     xl: float,
+    harvest_order: int | None = None,
 ) -> None:
+    field_no = int(field_id)
+    prev = _previous_harvest_date(harvest_date, field_no)
+    calculated_interval = (harvest_date - prev).days if prev else int(interval_days)
     payload = {
         "harvest_date": harvest_date.isoformat(),
-        "field_id": int(field_id),
-        "interval_days": int(interval_days),
+        "field_no": field_no,
+        "harvest_order": int(harvest_order) if harvest_order is not None else None,
         "a": float(a),
         "b": float(b),
         "c": float(c),
         "xl": float(xl),
+        "total": round(float(a) + float(b) + float(c) + float(xl), 3),
+        "previous_harvest_date": prev.isoformat() if prev else None,
+        "interval_days": calculated_interval,
+        "data_quality": "Kinnitatud",
+        "note": "Sisestatud KurgiMootor V6.2 äpis",
     }
-    _execute(
-        _client()
-        .table("harvests")
-        .upsert(payload, on_conflict="harvest_date,field_id")
-    )
+    _execute(_client().table("harvests").upsert(payload, on_conflict="harvest_date,field_no"))
 
 
 def get_harvest_for_day(day: date) -> List[Dict[str, Any]]:
     response = _execute(
-        _client()
-        .table("harvests")
-        .select("field_id,a,b,c,xl")
+        _client().table("harvests")
+        .select("field_no,harvest_order,a,b,c,xl,total,interval_days")
         .eq("harvest_date", day.isoformat())
+        .order("harvest_order")
+    )
+    rows = list(response.data or [])
+    # Hoidame app.py vana field_id liidese ühilduvana.
+    for row in rows:
+        row["field_id"] = row.get("field_no")
+    return rows
+
+
+def get_harvest_history(limit: int = 500) -> List[Dict[str, Any]]:
+    response = _execute(
+        _client().table("harvests")
+        .select("harvest_date,field_no,harvest_order,interval_days,a,b,c,xl,total,data_quality,note")
+        .order("harvest_date", desc=True)
+        .order("harvest_order")
+        .limit(int(limit))
     )
     return list(response.data or [])
 
 
-def get_harvest_history(limit: int = 300) -> List[Dict[str, Any]]:
+def upsert_weather(payload: Dict[str, Any]) -> None:
+    _execute(_client().table("weather_daily").upsert(payload, on_conflict="weather_date"))
+
+
+def get_weather_rows(start_day: date, end_day: date) -> List[Dict[str, Any]]:
     response = _execute(
-        _client()
-        .rpc("get_harvest_history", {"p_limit": int(limit)})
+        _client().table("weather_daily").select("*")
+        .gte("weather_date", start_day.isoformat())
+        .lte("weather_date", end_day.isoformat())
+        .order("weather_date")
     )
     return list(response.data or [])
 
 
+def get_weather_counts() -> Dict[str, int]:
+    rows = get_weather_rows(date(2020, 1, 1), date(2100, 1, 1))
+    return {
+        "measured": sum(1 for r in rows if r.get("data_kind") == "measured"),
+        "checked": sum(1 for r in rows if r.get("data_kind") == "measured" and bool(r.get("checked"))),
+        "forecast": sum(1 for r in rows if r.get("data_kind") == "forecast"),
+    }
 
-def get_weather_for_day(day: date) -> Dict[str, Any] | None:
+
+def get_latest_checked_measured_date() -> date | None:
     response = _execute(
-        _client()
-        .table("weather_daily")
-        .select("*")
-        .eq("weather_date", day.isoformat())
+        _client().table("weather_daily")
+        .select("weather_date")
+        .eq("data_kind", "measured")
+        .eq("checked", True)
+        .order("weather_date", desc=True)
         .limit(1)
     )
     rows = list(response.data or [])
-    return rows[0] if rows else None
-
-
-def save_weather(day: date, values: Dict[str, Any]) -> None:
-    payload: Dict[str, Any] = {"weather_date": day.isoformat()}
-    for key, value in values.items():
-        payload[key] = value if value not in ("",) else None
-
-    _execute(
-        _client()
-        .table("weather_daily")
-        .upsert(payload, on_conflict="weather_date")
-    )
-
-
-def get_weather_status(day: date) -> Dict[str, Any]:
-    response = _execute(
-        _client().rpc("get_weather_status", {"p_weather_date": day.isoformat()})
-    )
-    rows = list(response.data or [])
     if not rows:
-        return {"weather_date": day.isoformat(), "is_complete": False, "missing_fields": []}
-    return rows[0]
+        return None
+    try:
+        return date.fromisoformat(str(rows[0]["weather_date"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def get_incomplete_measured_dates(start_day: date, end_day: date) -> List[date]:
+    rows = get_weather_rows(start_day, end_day)
+    by_day = {str(r.get("weather_date")): r for r in rows if r.get("data_kind") == "measured"}
+    missing: List[date] = []
+    current = start_day
+    while current <= end_day:
+        row = by_day.get(current.isoformat())
+        required_values = (
+            "temp_min_c",
+            "temp_max_c",
+            "wind_avg_ms",
+            "radiation_mj_m2",
+            "humidity_avg_pct",
+            "precipitation_mm",
+            "et0_mm",
+        )
+        if (
+            not row
+            or not bool(row.get("checked"))
+            or any(row.get(field) is None for field in required_values)
+        ):
+            missing.append(current)
+        current += date.resolution
+    return missing
+
+
+def set_app_setting(key: str, value: str) -> None:
+    _execute(_client().table("app_settings").upsert({"key": key, "value": str(value)}, on_conflict="key"))
+
+
+def get_app_setting(key: str, default: str = "") -> str:
+    response = _execute(_client().table("app_settings").select("value").eq("key", key).limit(1))
+    rows = list(response.data or [])
+    return str(rows[0]["value"]) if rows else default
