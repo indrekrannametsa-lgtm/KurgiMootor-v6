@@ -21,6 +21,16 @@ def _fmt(value: float, digits: int = 1) -> str:
     return f"{value:.{digits}f}".replace(".", ",")
 
 
+
+
+def _format_field_value(value, digits=1):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    try:
+        return _fmt(float(value), digits)
+    except (TypeError, ValueError):
+        return str(value)
+
 def _short_date(value: date) -> str:
     months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
     return f"{value.day:02d}. {months[value.month - 1]}"
@@ -141,13 +151,6 @@ def _render_day_block(day_label, rows, show_quality=False, planned_fields=None):
     )
 
     df, missing_rows = _field_table(rows, planned_fields=planned_fields)
-    def _format_field_value(value, digits=1):
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            return "—"
-        try:
-            return _fmt(float(value), digits)
-        except (TypeError, ValueError):
-            return str(value)
 
     formatters = {
         "A": lambda v: _format_field_value(v, 1),
