@@ -1,5 +1,8 @@
 from datetime import date, timedelta
+from pathlib import Path
 import math
+
+from PIL import Image
 
 import numpy as np
 import pandas as pd
@@ -9,7 +12,9 @@ import db
 from core import WeatherService
 
 TODAY = date.today()
-st.set_page_config(page_title="KurgiMootor V6.4", page_icon="🥒", layout="wide")
+APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "kurgimootor_icon.png"
+APP_ICON = Image.open(APP_ICON_PATH)
+st.set_page_config(page_title="KurgiMootor V6.4", page_icon=APP_ICON, layout="wide")
 
 
 def _n(value) -> float:
