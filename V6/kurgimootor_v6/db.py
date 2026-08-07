@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List
 
 import streamlit as st
@@ -183,3 +183,58 @@ def get_app_setting(key: str, default: str = "") -> str:
     response = _execute(_client().table("app_settings").select("value").eq("key", key).limit(1))
     rows = list(response.data or [])
     return str(rows[0]["value"]) if rows else default
+
+
+def save_yield_forecasts(rows: List[Dict[str, Any]]) -> int:
+    """Save/update one forecast snapshot per forecast day + target day + field + model.
+
+    Re-running the app on the same day updates the same snapshot instead of creating
+    duplicates. A new calendar day creates a new lead-time snapshot automatically.
+    """
+    if not rows:
+        return 0
+    generated_at = datetime.now(timezone.utc).isoformat()
+    payloads: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = {
+            "forecast_date": str(row["forecast_date"]),
+            "target_date": str(row["target_date"]),
+            "field_no": int(row["field_no"]),
+            "lead_days": int(row["lead_days"]),
+            "abc_forecast": float(row["abc_forecast"]),
+            "xl_forecast": float(row["xl_forecast"]),
+            "total_forecast": float(row["total_forecast"]),
+            "interval_days": int(row["interval_days"]) if row.get("interval_days") is not None else None,
+            "basis": str(row.get("basis") or ""),
+            "estimated_weather_days": str(row.get("estimated_weather_days") or ""),
+            "model_version": str(row.get("model_version") or "v6.3-abc-xl"),
+            "generated_at": generated_at,
+        }
+        payloads.append(payload)
+    _execute(
+        _client().table("yield_forecasts").upsert(
+            payloads,
+            on_conflict="forecast_date,target_date,field_no,model_version",
+        )
+    )
+    return len(payloads)
+
+
+def get_yield_forecasts(limit: int = 1000) -> List[Dict[str, Any]]:
+    response = _execute(
+        _client().table("yield_forecasts")
+        .select("forecast_date,target_date,field_no,lead_days,abc_forecast,xl_forecast,total_forecast,interval_days,basis,estimated_weather_days,model_version,generated_at")
+        .order("target_date", desc=True)
+        .order("field_no")
+        .order("forecast_date", desc=True)
+        .limit(int(limit))
+    )
+    return list(response.data or [])
+
+
+def yield_forecasts_available() -> bool:
+    try:
+        _execute(_client().table("yield_forecasts").select("id").limit(1))
+        return True
+    except DatabaseError:
+        return False

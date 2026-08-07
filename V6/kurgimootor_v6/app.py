@@ -653,6 +653,12 @@ with tabs[3]:
         except (TypeError, ValueError):
             continue
 
+        # Hinnangulist vana korjet ei kasuta mudeli sihtreana. See võib jääda
+        # ajajoone lähtepunktiks, kuid oletuslik saak ei tohi õpetada mudelit nagu tegelik mõõtmine.
+        current_quality = str(current_row.get("data_quality") or "").strip().lower()
+        if current_quality == "hinnanguline":
+            continue
+
         window_weather = []
         cursor = sample["previous_day"] + timedelta(days=1)
         while cursor <= sample["current_day"]:
@@ -702,6 +708,17 @@ with tabs[3]:
         previous2_c = _maybe_float(previous2_row.get("c"))
         previous_abc = (previous_a + previous_b + previous_c) if None not in (previous_a, previous_b, previous_c) else None
         previous2_abc = (previous2_a + previous2_b + previous2_c) if None not in (previous2_a, previous2_b, previous2_c) else None
+
+        # Kui eelmine saak oli ainult hinnanguline, kasutame selle kuupäeva intervalli
+        # määramiseks, kuid mitte saagi/XL lag-tunnusena. Mudeli missing-indikaator
+        # saab siis ausalt aru, et eelmine saagitase pole usaldusväärne.
+        prev_quality = str(previous_row.get("data_quality") or "").strip().lower()
+        prev2_quality = str(previous2_row.get("data_quality") or "").strip().lower()
+        if prev_quality == "hinnanguline":
+            previous_total = previous_abc = previous_xl = None
+        if prev2_quality == "hinnanguline":
+            previous2_total = previous2_abc = previous2_xl = None
+
         previous_xl_share = (previous_xl / previous_total) if (previous_xl is not None and previous_total and previous_total > 0) else None
         previous2_xl_share = (previous2_xl / previous2_total) if (previous2_xl is not None and previous2_total and previous2_total > 0) else None
         previous_cb = (previous_c / previous_b) if (previous_c is not None and previous_b and previous_b > 0) else None
@@ -995,6 +1012,11 @@ with tabs[3]:
             "Põhimudel ennustab A+B+C. XL lisatakse eraldi korjejäägi komponendina. "
             "Korjevahemiku möödunud päevadel kasutatakse mõõdetud ilma ja tulevastel päevadel 9 päeva ilmaprognoosi."
         )
+        st.info(
+            "Oluline: ajalooline walk-forward MAE mõõdab saagimudelit realiseerunud mõõdetud ilma peal. "
+            "Päris 1–5 päeva prognoos sisaldab lisaks ilmaprognoosi viga. Operatiivset täpsust hakkame mõõtma "
+            "yield_forecasts snapshot'ide põhjal, kui tegelikud korjed saabuvad."
+        )
 
         future_weather_end = TODAY + timedelta(days=8)
         all_weather_rows = db.get_weather_rows(readiness_start, future_weather_end)
@@ -1146,6 +1168,38 @@ with tabs[3]:
             forecast_days.append((target_day, day_rows))
             current_first = _next_field(day_fields[-1])
 
+        # Salvestame 5 päeva prognoosid eraldi ajalukku. Sama päeva rerun uuendab
+        # olemasolevat snapshot'i; järgmine päev loob uue lead-time snapshot'i.
+        MODEL_VERSION = "v6.3-abc-xl-ridge-v2-audited"
+        forecast_payloads = []
+        for target_day, rows_day in forecast_days:
+            for row in rows_day:
+                if row.get("A+B+C") is None or row.get("XL") is None or row.get("Kokku") is None:
+                    continue
+                forecast_payloads.append({
+                    "forecast_date": TODAY.isoformat(),
+                    "target_date": target_day.isoformat(),
+                    "field_no": int(row["Põld"]),
+                    "lead_days": (target_day - TODAY).days,
+                    "abc_forecast": float(row["A+B+C"]),
+                    "xl_forecast": float(row["XL"]),
+                    "total_forecast": float(row["Kokku"]),
+                    "interval_days": row.get("Intervall"),
+                    "basis": row.get("Alus") or "",
+                    "estimated_weather_days": row.get("Hinnanguline ilm") or "",
+                    "model_version": MODEL_VERSION,
+                })
+
+        forecast_store_ok = False
+        try:
+            if db.yield_forecasts_available():
+                db.save_yield_forecasts(forecast_payloads)
+                forecast_store_ok = True
+            else:
+                st.warning("Prognoosid arvutatakse, kuid neid ei salvestata veel: Supabase'is puudub yield_forecasts tabel. Käivita ZIP-is olev supabase_yield_forecasts.sql üks kord.")
+        except db.DatabaseError as exc:
+            st.warning(f"Prognoosid arvutatakse, kuid ajaloo salvestamine ebaõnnestus: {exc}")
+
         if internal_today:
             st.caption("Tänase poolelioleva korje sisemine tööprognoos: " + ", ".join(f"põld {f} ≈ {p:.1f}" for f,p in internal_today) + ". Tegelik kirje asendab selle automaatselt.")
         if any_weather_imputation:
@@ -1167,6 +1221,76 @@ with tabs[3]:
         abc_mae_text = f"{current_test_mae:.1f} kasti/põld" if current_test_mae is not None else "veel hindamata"
         total_mae_text = f"{current_total_test_mae:.1f} kasti/põld" if current_total_test_mae is not None else "veel hindamata"
         st.caption(f"A+B+C ajaline testviga: {abc_mae_text}. Kogusaagi (ABC+XL) testviga: {total_mae_text}. Kaugematel päevadel kasvab ebakindlus rekursiivse eelkorje tõttu.")
+
+        # -------------------------------------------------------------------------
+        # Salvestatud prognoos vs tegelik
+        # -------------------------------------------------------------------------
+        if forecast_store_ok:
+            st.markdown("##### Prognooside ajalugu")
+            st.caption("Iga päev jääb alles uus 1–5 päeva ette tehtud snapshot. Tegelik korje liidetakse kuvamisel automaatselt harvests tabelist.")
+            try:
+                saved_forecasts = db.get_yield_forecasts(limit=1000)
+            except db.DatabaseError:
+                saved_forecasts = []
+            actual_lookup = {}
+            for hr in harvest_rows:
+                try:
+                    key = (str(hr.get("harvest_date")), int(hr.get("field_no")))
+                    a = float(hr.get("a")); b = float(hr.get("b")); c = float(hr.get("c")); xl = float(hr.get("xl")); total = float(hr.get("total"))
+                    actual_lookup[key] = {"abc": a+b+c, "xl": xl, "total": total}
+                except (TypeError, ValueError):
+                    continue
+
+            history_rows = []
+            for fr in saved_forecasts:
+                if str(fr.get("model_version")) != MODEL_VERSION:
+                    continue
+                key = (str(fr.get("target_date")), int(fr.get("field_no")))
+                actual = actual_lookup.get(key)
+                try:
+                    abc_f = float(fr.get("abc_forecast")); xl_f = float(fr.get("xl_forecast")); total_f = float(fr.get("total_forecast"))
+                except (TypeError, ValueError):
+                    continue
+                history_rows.append({
+                    "Prognoositud": str(fr.get("forecast_date")),
+                    "Korjepäev": str(fr.get("target_date")),
+                    "Põld": int(fr.get("field_no")),
+                    "Ette": int(fr.get("lead_days") or 0),
+                    "ABC prognoos": abc_f,
+                    "XL prognoos": xl_f,
+                    "Kokku prognoos": total_f,
+                    "ABC tegelik": actual.get("abc") if actual else None,
+                    "XL tegelik": actual.get("xl") if actual else None,
+                    "Kokku tegelik": actual.get("total") if actual else None,
+                    "Kogu viga": (total_f - actual["total"]) if actual else None,
+                })
+            hist_df = pd.DataFrame(history_rows)
+            if not hist_df.empty:
+                matured = hist_df[pd.notna(hist_df["Kokku tegelik"])].copy()
+                if not matured.empty:
+                    hm1, hm2, hm3, hm4 = st.columns(4)
+                    abs_err = matured["Kogu viga"].abs()
+                    hm1.metric("Pärisprognoose hinnatud", len(matured))
+                    hm2.metric("MAE", f"{abs_err.mean():.1f} kasti")
+                    hm3.metric("±2 sees", f"{(abs_err <= 2).mean()*100:.0f}%")
+                    one_day = matured[matured["Ette"] == 1]
+                    hm4.metric("1 p MAE", "—" if one_day.empty else f"{one_day['Kogu viga'].abs().mean():.1f} kasti")
+                hist_show = hist_df.sort_values(["Korjepäev", "Põld", "Ette"], ascending=[False, True, True]).head(120).copy()
+                for dc in ("Prognoositud", "Korjepäev"):
+                    hist_show[dc] = hist_show[dc].map(lambda x: date.fromisoformat(x).strftime("%d.%m") if x else "—")
+                st.dataframe(
+                    hist_show.style.format({
+                        "Ette": lambda v: f"{int(v)} p",
+                        "ABC prognoos": "{:.1f}", "XL prognoos": "{:.1f}", "Kokku prognoos": "{:.1f}",
+                        "ABC tegelik": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                        "XL tegelik": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                        "Kokku tegelik": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                        "Kogu viga": lambda v: "—" if pd.isna(v) else f"{v:+.1f}",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
+            else:
+                st.caption("Esimesed prognoosisnapshot'id salvestatakse nüüd. Tegelike korjete lisandudes tekib siia võrdlus.")
 
         # -------------------------------------------------------------------------
         # Jäljeotsija v1 — automaatne tunnusegruppide kontroll
