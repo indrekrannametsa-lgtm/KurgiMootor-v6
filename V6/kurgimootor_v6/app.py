@@ -494,7 +494,11 @@ with tabs[2]:
         "ET0 mm": r.get("et0_mm"),
         "Radiatsioon MJ/m²": r.get("radiation_mj_m2"),
         "Kontroll": r.get("check_message"),
-        "Olek": "🟢 Kontrollitud" if r.get("checked") else "🔴 Puudulik",
+        "Olek": (
+            "🟢 Kontrollitud"
+            if r.get("checked")
+            else ("🟡 Ajutine prognoos" if str(r.get("check_message") or "").startswith("Ajutine") else "🔴 Puudulik")
+        ),
     } for r in measured_rows]
     st.dataframe(pd.DataFrame(measured_display), use_container_width=True, hide_index=True)
 

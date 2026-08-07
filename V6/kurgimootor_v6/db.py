@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List
 
@@ -183,6 +185,35 @@ def get_app_setting(key: str, default: str = "") -> str:
     response = _execute(_client().table("app_settings").select("value").eq("key", key).limit(1))
     rows = list(response.data or [])
     return str(rows[0]["value"]) if rows else default
+
+
+def save_weather_forecast_snapshot(day: date, payload: Dict[str, Any]) -> None:
+    """Säilitab päeva forecast'i eraldi, et minevikku jõudes ei kaoks see measured upsert'iga."""
+    key = f"weather_forecast_snapshot_{day.isoformat()}"
+    compact = {
+        "weather_date": day.isoformat(),
+        "temp_min_c": payload.get("temp_min_c"),
+        "temp_max_c": payload.get("temp_max_c"),
+        "wind_avg_ms": payload.get("wind_avg_ms"),
+        "radiation_mj_m2": payload.get("radiation_mj_m2"),
+        "humidity_avg_pct": payload.get("humidity_avg_pct"),
+        "precipitation_mm": payload.get("precipitation_mm"),
+        "et0_mm": payload.get("et0_mm"),
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    set_app_setting(key, json.dumps(compact, ensure_ascii=False))
+
+
+def get_weather_forecast_snapshot(day: date) -> Dict[str, Any] | None:
+    key = f"weather_forecast_snapshot_{day.isoformat()}"
+    raw = get_app_setting(key, "")
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def save_yield_forecasts(rows: List[Dict[str, Any]]) -> int:

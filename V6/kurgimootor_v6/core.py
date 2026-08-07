@@ -326,21 +326,11 @@ class WeatherService:
 
     def refresh_measured(self, start_day: date, end_day: date) -> Dict[str, int]:
         parnu = self._parnu_daily(start_day, end_day)
-
-        # Eelistame valideeritud ööpäevaelemente.
         radiation_daily = self._parnu_daily_element("DRQS", start_day, end_day)
         humidity_daily = self._parnu_daily_element("DRH08", start_day, end_day)
         precipitation_daily = self._parnu_daily_element("DPREC", start_day, end_day)
 
-        # Kui päevafail pole veel valmis, kasutame ajutiselt sama Pärnu jaama
-        # ametlikke tunniandmeid. Keskkonnaportaali elemendid:
-        # RH = suhteline õhuniiskus; PR1H = tunni sademete summa;
-        # SDUR1H = tunni summeeritud päikesepaiste kestus minutites.
-        humidity_hourly = self._parnu_hourly_daily_element("RH", start_day, end_day, "mean")
-        precipitation_hourly = self._parnu_hourly_daily_element("PR1H", start_day, end_day, "sum")
-        sunshine_minutes_hourly = self._parnu_hourly_daily_element("SDUR1H", start_day, end_day, "sum")
-
-        saved = checked = fallback_days = 0
+        saved = checked = temporary = 0
         d = start_day
         while d <= end_day:
             key = d.isoformat()
@@ -349,43 +339,66 @@ class WeatherService:
             t_max = local.get("t_max")
             wind_avg = local.get("wind_avg")
 
-            fallback_parts: List[str] = []
-
             rad = radiation_daily.get(key)
-            if rad is None:
-                sunshine_minutes = sunshine_minutes_hourly.get(key)
-                sunshine_hours = (sunshine_minutes / 60.0) if sunshine_minutes is not None else None
-                rad = self._radiation_from_sunshine_hours(d, sunshine_hours)
-                if rad is not None:
-                    fallback_parts.append("radiatsioon SDUR1H-st")
-
             humidity_avg = humidity_daily.get(key)
-            if humidity_avg is None:
-                humidity_avg = humidity_hourly.get(key)
-                if humidity_avg is not None:
-                    fallback_parts.append("niiskus RH-tundidest")
-
             precipitation_mm = precipitation_daily.get(key)
-            if precipitation_mm is None:
-                precipitation_mm = precipitation_hourly.get(key)
-                if precipitation_mm is not None:
-                    fallback_parts.append("sademed PR1H-st")
 
+            # Ainult selle kuupäeva ENNE säilitatud forecast võib täita veel
+            # avaldamata Pärnu päevaelemente. Minevikku uut forecast'i ei küsita.
+            forecast_snapshot = db.get_weather_forecast_snapshot(d)
+            forecast_parts: List[str] = []
+            if forecast_snapshot:
+                if rad is None and forecast_snapshot.get("radiation_mj_m2") is not None:
+                    rad = self._as_float(forecast_snapshot.get("radiation_mj_m2"))
+                    forecast_parts.append("radiatsioon")
+                if humidity_avg is None and forecast_snapshot.get("humidity_avg_pct") is not None:
+                    humidity_avg = self._as_float(forecast_snapshot.get("humidity_avg_pct"))
+                    forecast_parts.append("niiskus")
+                if precipitation_mm is None and forecast_snapshot.get("precipitation_mm") is not None:
+                    precipitation_mm = self._as_float(forecast_snapshot.get("precipitation_mm"))
+                    forecast_parts.append("sademed")
+
+            # ET0 arvutame hübriidrea enda sisenditest: mõõdetud Tmin/Tmax/tuul +
+            # vajadusel varem salvestatud forecast'i rad/RH.
             et0_mm = self.calculate_et0_mm(d, t_min, t_max, wind_avg, rad, humidity_avg)
-            problems = self._validate_measured(
+
+            raw_problems = self._validate_measured(
+                t_min, t_max, wind_avg,
+                radiation_daily.get(key),
+                humidity_daily.get(key),
+                precipitation_daily.get(key),
+                self.calculate_et0_mm(
+                    d, t_min, t_max, wind_avg,
+                    radiation_daily.get(key),
+                    humidity_daily.get(key),
+                ),
+            )
+
+            # "checked" tähendab nüüd ainult täielikult ametlikku Pärnu päeva.
+            fully_official = (
+                t_min is not None
+                and t_max is not None
+                and wind_avg is not None
+                and key in radiation_daily
+                and key in humidity_daily
+                and key in precipitation_daily
+                and not raw_problems
+            )
+
+            usable_problems = self._validate_measured(
                 t_min, t_max, wind_avg, rad, humidity_avg, precipitation_mm, et0_mm
             )
 
-            used_fallback = bool(fallback_parts)
-            if used_fallback:
-                fallback_days += 1
-
-            if problems:
-                check_message = "; ".join(problems)
-            elif used_fallback:
-                check_message = "Kontrollitud · ajutine tunni-fallback: " + ", ".join(fallback_parts)
+            if fully_official:
+                check_message = "Kontrollitud · valideeritud Pärnu päevaelemendid"
+            elif not usable_problems and forecast_parts:
+                temporary += 1
+                check_message = (
+                    "Ajutine · Pärnu T/tuul + varem salvestatud prognoos: "
+                    + ", ".join(forecast_parts)
+                )
             else:
-                check_message = "Kontrollitud · valideeritud päevaelemendid"
+                check_message = "; ".join(usable_problems) if usable_problems else "Puudulik"
 
             db.upsert_weather({
                 "weather_date": key,
@@ -398,16 +411,19 @@ class WeatherService:
                 "precipitation_mm": precipitation_mm,
                 "et0_mm": et0_mm,
                 "source_station": "Pärnu",
-                "radiation_station": "Pärnu" + (" (SDUR1H hinnang)" if rad is not None and key not in radiation_daily else ""),
-                "checked": not problems,
+                "radiation_station": (
+                    "Pärnu" if key in radiation_daily
+                    else ("Open-Meteo (varasem salvestatud prognoos)" if "radiatsioon" in forecast_parts else "Pärnu")
+                ),
+                "checked": bool(fully_official),
                 "check_message": check_message,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             })
             saved += 1
-            checked += int(not problems)
+            checked += int(fully_official)
             d += timedelta(days=1)
 
-        return {"saved": saved, "checked": checked, "fallback_days": fallback_days}
+        return {"saved": saved, "checked": checked, "temporary": temporary}
 
     def refresh_forecast(self, start_day: date, days: int = 10) -> Dict[str, int]:
         end_day = start_day + timedelta(days=days - 1)
@@ -451,7 +467,7 @@ class WeatherService:
             if humidity_avg is None: problems.append("õhuniiskuse prognoos puudub")
             if precipitation_mm is None: problems.append("sademete prognoos puudub")
             if et0_mm is None: problems.append("ET0 prognoos ei arvutunud")
-            db.upsert_weather({
+            forecast_payload = {
                 "weather_date": key,
                 "data_kind": "forecast",
                 "temp_min_c": t_min,
@@ -466,9 +482,15 @@ class WeatherService:
                 "checked": not problems,
                 "check_message": "; ".join(problems) if problems else "Prognoos olemas",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-            })
+            }
+
+            # Säilita forecast eraldi enne weather_daily upsert'i. Nii ei kao
+            # eilse päeva prognoos ära, kui mõõdetud Pärnu rida sama kuupäeva üle kirjutab.
+            db.save_weather_forecast_snapshot(date.fromisoformat(key), forecast_payload)
+            db.upsert_weather(forecast_payload)
             saved += 1
         return {"saved": saved}
+
 
     def test_sources(self, today: date) -> Dict[str, Any]:
         """Kontrollib Pärnu mõõteallikaid ja Open-Meteo prognoosi ilma Supabase'i kirjutamata."""
@@ -553,7 +575,7 @@ class WeatherService:
 
         missing = db.get_incomplete_measured_dates(season_start, target_end)
 
-        # Viimased 3 lõppenud päeva kontrollime alati uuesti. Nii saab tunni-fallback
+        # Viimased 3 lõppenud päeva kontrollime alati uuesti. Nii saab ajutine salvestatud prognoos
         # järgmisel käivitamisel automaatselt asenduda DRQS/DRH08/DPREC valideeritud
         # päevaelementidega, ilma et kasutaja peaks midagi käsitsi puhastama.
         recent_start = max(season_start, target_end - timedelta(days=2))
