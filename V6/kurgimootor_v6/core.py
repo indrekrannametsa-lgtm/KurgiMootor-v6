@@ -17,7 +17,7 @@ ESTONIA = ZoneInfo("Europe/Tallinn")
 OFFICIAL_HOURLY = "https://keskkonnaandmed.envir.ee/f_kliima_tund"
 OFFICIAL_DAILY = "https://keskkonnaandmed.envir.ee/f_kliima_paev"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
-HEADERS = {"Accept-Profile": "apijahiala", "Accept": "application/json"}
+HEADERS = {"Accept-Profile": "apijahialad", "Accept": "application/json"}
 FARM_LAT = 58.13
 FARM_LON = 24.50
 FARM_ELEVATION_M = 5.0
@@ -109,6 +109,74 @@ class WeatherService:
             result[d.isoformat()] = item
             d += timedelta(days=1)
         return result
+
+    def _parnu_hourly_daily_element(
+        self,
+        element_code: str,
+        start_day: date,
+        end_day: date,
+        reducer: str = "mean",
+    ) -> Dict[str, float]:
+        """Koondab Pärnu ametliku tunni-elemendi kohaliku kalendripäeva kaupa.
+
+        Toetatud reducerid:
+        - mean: tunni hetkväärtuste keskmine (nt RH)
+        - sum: tunni summade summa (nt PR1H, SDUR1H)
+        """
+        rows = self._official_rows(
+            OFFICIAL_HOURLY,
+            "Pärnu",
+            element_code,
+            start_day - timedelta(days=1),
+            end_day,
+        )
+        values: Dict[date, List[float]] = defaultdict(list)
+        for row in rows:
+            d = self._hourly_local_day(row)
+            value = self._as_float(row.get("vaartus"))
+            if d and value is not None and start_day <= d <= end_day:
+                values[d].append(value)
+
+        result: Dict[str, float] = {}
+        d = start_day
+        while d <= end_day:
+            vals = values.get(d) or []
+            if vals:
+                result[d.isoformat()] = float(sum(vals) if reducer == "sum" else mean(vals))
+            d += timedelta(days=1)
+        return result
+
+    @staticmethod
+    def _radiation_from_sunshine_hours(day: date, sunshine_hours: float | None) -> float | None:
+        """Ajutine Rs hinnang ametlikust SDUR1H päikesepaistest (FAO-56 Ångström–Prescott).
+
+        Rs = (0.25 + 0.50 * n/N) * Ra
+        Kus n on mõõdetud päikesepaiste kestus ja N astronoomiline päevapikkus.
+        Kasutatakse ainult siis, kui valideeritud DRQS pole veel avaldatud.
+        """
+        if sunshine_hours is None:
+            return None
+        n = max(0.0, float(sunshine_hours))
+        j = day.timetuple().tm_yday
+        phi = FARM_LAT * pi / 180.0
+        dr = 1.0 + 0.033 * cos((2.0 * pi / 365.0) * j)
+        solar_declination = 0.409 * sin((2.0 * pi / 365.0) * j - 1.39)
+        sunset_angle = acos(max(-1.0, min(1.0, -tan(phi) * tan(solar_declination))))
+        ra = (
+            (24.0 * 60.0 / pi)
+            * 0.0820
+            * dr
+            * (
+                sunset_angle * sin(phi) * sin(solar_declination)
+                + cos(phi) * cos(solar_declination) * sin(sunset_angle)
+            )
+        )
+        N = 24.0 * sunset_angle / pi
+        if N <= 0:
+            return None
+        n = min(n, N)
+        rs = (0.25 + 0.50 * (n / N)) * ra
+        return round(max(0.0, rs), 3)
 
     def _parnu_daily_element(self, element_code: str, start_day: date, end_day: date) -> Dict[str, float]:
         """Loeb Pärnu valideeritud ööpäevaelemendi (nt DRQS, DRH08, DPREC)."""
@@ -258,10 +326,21 @@ class WeatherService:
 
     def refresh_measured(self, start_day: date, end_day: date) -> Dict[str, int]:
         parnu = self._parnu_daily(start_day, end_day)
-        radiation = self._parnu_daily_element("DRQS", start_day, end_day)
-        humidity = self._parnu_daily_element("DRH08", start_day, end_day)
-        precipitation = self._parnu_daily_element("DPREC", start_day, end_day)
-        saved = checked = 0
+
+        # Eelistame valideeritud ööpäevaelemente.
+        radiation_daily = self._parnu_daily_element("DRQS", start_day, end_day)
+        humidity_daily = self._parnu_daily_element("DRH08", start_day, end_day)
+        precipitation_daily = self._parnu_daily_element("DPREC", start_day, end_day)
+
+        # Kui päevafail pole veel valmis, kasutame ajutiselt sama Pärnu jaama
+        # ametlikke tunniandmeid. Keskkonnaportaali elemendid:
+        # RH = suhteline õhuniiskus; PR1H = tunni sademete summa;
+        # SDUR1H = tunni summeeritud päikesepaiste kestus minutites.
+        humidity_hourly = self._parnu_hourly_daily_element("RH", start_day, end_day, "mean")
+        precipitation_hourly = self._parnu_hourly_daily_element("PR1H", start_day, end_day, "sum")
+        sunshine_minutes_hourly = self._parnu_hourly_daily_element("SDUR1H", start_day, end_day, "sum")
+
+        saved = checked = fallback_days = 0
         d = start_day
         while d <= end_day:
             key = d.isoformat()
@@ -269,13 +348,45 @@ class WeatherService:
             t_min = local.get("t_min")
             t_max = local.get("t_max")
             wind_avg = local.get("wind_avg")
-            rad = radiation.get(key)
-            humidity_avg = humidity.get(key)
-            precipitation_mm = precipitation.get(key)
+
+            fallback_parts: List[str] = []
+
+            rad = radiation_daily.get(key)
+            if rad is None:
+                sunshine_minutes = sunshine_minutes_hourly.get(key)
+                sunshine_hours = (sunshine_minutes / 60.0) if sunshine_minutes is not None else None
+                rad = self._radiation_from_sunshine_hours(d, sunshine_hours)
+                if rad is not None:
+                    fallback_parts.append("radiatsioon SDUR1H-st")
+
+            humidity_avg = humidity_daily.get(key)
+            if humidity_avg is None:
+                humidity_avg = humidity_hourly.get(key)
+                if humidity_avg is not None:
+                    fallback_parts.append("niiskus RH-tundidest")
+
+            precipitation_mm = precipitation_daily.get(key)
+            if precipitation_mm is None:
+                precipitation_mm = precipitation_hourly.get(key)
+                if precipitation_mm is not None:
+                    fallback_parts.append("sademed PR1H-st")
+
             et0_mm = self.calculate_et0_mm(d, t_min, t_max, wind_avg, rad, humidity_avg)
             problems = self._validate_measured(
                 t_min, t_max, wind_avg, rad, humidity_avg, precipitation_mm, et0_mm
             )
+
+            used_fallback = bool(fallback_parts)
+            if used_fallback:
+                fallback_days += 1
+
+            if problems:
+                check_message = "; ".join(problems)
+            elif used_fallback:
+                check_message = "Kontrollitud · ajutine tunni-fallback: " + ", ".join(fallback_parts)
+            else:
+                check_message = "Kontrollitud · valideeritud päevaelemendid"
+
             db.upsert_weather({
                 "weather_date": key,
                 "data_kind": "measured",
@@ -287,15 +398,16 @@ class WeatherService:
                 "precipitation_mm": precipitation_mm,
                 "et0_mm": et0_mm,
                 "source_station": "Pärnu",
-                "radiation_station": "Pärnu",
+                "radiation_station": "Pärnu" + (" (SDUR1H hinnang)" if rad is not None and key not in radiation_daily else ""),
                 "checked": not problems,
-                "check_message": "; ".join(problems) if problems else "Kontrollitud",
+                "check_message": check_message,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             })
             saved += 1
             checked += int(not problems)
             d += timedelta(days=1)
-        return {"saved": saved, "checked": checked}
+
+        return {"saved": saved, "checked": checked, "fallback_days": fallback_days}
 
     def refresh_forecast(self, start_day: date, days: int = 10) -> Dict[str, int]:
         end_day = start_day + timedelta(days=days - 1)
@@ -363,8 +475,15 @@ class WeatherService:
         measured_day = today - timedelta(days=1)
         temp_rows = self._official_rows(OFFICIAL_HOURLY, "Pärnu", "TA", measured_day - timedelta(days=1), measured_day)
         wind_rows = self._official_rows(OFFICIAL_HOURLY, "Pärnu", "WS10M", measured_day - timedelta(days=1), measured_day)
+        rh_rows = self._official_rows(OFFICIAL_HOURLY, "Pärnu", "RH", measured_day - timedelta(days=1), measured_day)
+        pr1h_rows = self._official_rows(OFFICIAL_HOURLY, "Pärnu", "PR1H", measured_day - timedelta(days=1), measured_day)
+        sdur_rows = self._official_rows(OFFICIAL_HOURLY, "Pärnu", "SDUR1H", measured_day - timedelta(days=1), measured_day)
+
         temp_rows_for_day = [r for r in temp_rows if self._hourly_local_day(r) == measured_day]
         wind_rows_for_day = [r for r in wind_rows if self._hourly_local_day(r) == measured_day]
+        rh_rows_for_day = [r for r in rh_rows if self._hourly_local_day(r) == measured_day]
+        pr1h_rows_for_day = [r for r in pr1h_rows if self._hourly_local_day(r) == measured_day]
+        sdur_rows_for_day = [r for r in sdur_rows if self._hourly_local_day(r) == measured_day]
 
         radiation = self._parnu_daily_element("DRQS", measured_day, measured_day)
         humidity = self._parnu_daily_element("DRH08", measured_day, measured_day)
@@ -412,6 +531,9 @@ class WeatherService:
             "measured_day": key,
             "parnu_temperature_rows": len(temp_rows_for_day),
             "parnu_wind_rows": len(wind_rows_for_day),
+            "parnu_rh_hourly_rows": len(rh_rows_for_day),
+            "parnu_pr1h_hourly_rows": len(pr1h_rows_for_day),
+            "parnu_sdur1h_hourly_rows": len(sdur_rows_for_day),
             "parnu_radiation_rows": int(key in radiation),
             "parnu_humidity_rows": int(key in humidity),
             "parnu_precipitation_rows": int(key in precipitation),
@@ -430,10 +552,22 @@ class WeatherService:
             return {"saved": 0, "checked": 0, "ranges": []}
 
         missing = db.get_incomplete_measured_dates(season_start, target_end)
+
+        # Viimased 3 lõppenud päeva kontrollime alati uuesti. Nii saab tunni-fallback
+        # järgmisel käivitamisel automaatselt asenduda DRQS/DRH08/DPREC valideeritud
+        # päevaelementidega, ilma et kasutaja peaks midagi käsitsi puhastama.
+        recent_start = max(season_start, target_end - timedelta(days=2))
+        recent_days: List[date] = []
+        cursor = recent_start
+        while cursor <= target_end:
+            recent_days.append(cursor)
+            cursor += timedelta(days=1)
+
+        missing = sorted(set(missing + recent_days))
         if not missing:
             return {"saved": 0, "checked": 0, "ranges": []}
 
-        # Koondame järjestikused puuduvad päevad vahemikeks, et API-kutseid oleks vähe,
+        # Koondame järjestikused puuduvad/uuesti kontrollitavad päevad vahemikeks, et API-kutseid oleks vähe,
         # kuid juba kontrollitud ridu ei kirjutataks uuesti üle.
         ranges: List[tuple[date, date]] = []
         range_start = range_end = missing[0]
