@@ -683,14 +683,53 @@ with tabs[3]:
             except (TypeError, ValueError):
                 return None
 
+        current_a = _maybe_float(current_row.get("a"))
+        current_b = _maybe_float(current_row.get("b"))
+        current_c = _maybe_float(current_row.get("c"))
+        current_xl = _maybe_float(current_row.get("xl"))
+        if current_a is None or current_b is None or current_c is None or current_xl is None:
+            continue
+        target_abc = current_a + current_b + current_c
+
         previous_xl = _maybe_float(previous_row.get("xl"))
         previous2_xl = _maybe_float(previous2_row.get("xl"))
+        previous2_total = _maybe_float(previous2_row.get("total"))
+        previous_a = _maybe_float(previous_row.get("a"))
+        previous_b = _maybe_float(previous_row.get("b"))
+        previous_c = _maybe_float(previous_row.get("c"))
+        previous2_a = _maybe_float(previous2_row.get("a"))
+        previous2_b = _maybe_float(previous2_row.get("b"))
+        previous2_c = _maybe_float(previous2_row.get("c"))
+        previous_abc = (previous_a + previous_b + previous_c) if None not in (previous_a, previous_b, previous_c) else None
+        previous2_abc = (previous2_a + previous2_b + previous2_c) if None not in (previous2_a, previous2_b, previous2_c) else None
+        previous_xl_share = (previous_xl / previous_total) if (previous_xl is not None and previous_total and previous_total > 0) else None
+        previous2_xl_share = (previous2_xl / previous2_total) if (previous2_xl is not None and previous2_total and previous2_total > 0) else None
+        previous_cb = (previous_c / previous_b) if (previous_c is not None and previous_b and previous_b > 0) else None
+        previous2_cb = (previous2_c / previous2_b) if (previous2_c is not None and previous2_b and previous2_b > 0) else None
+        yield_trend = (previous_abc - previous2_abc) if (previous_abc is not None and previous2_abc is not None) else None
+
+        def _tail_weather(n):
+            tail = window_weather[-min(n, len(window_weather)):]
+            mt = [(_n(w.get("temp_min_c")) + _n(w.get("temp_max_c"))) / 2 for w in tail]
+            return {
+                f"T viim{n}": sum(mt) / len(mt),
+                f"Rad viim{n}": sum(_n(w.get("radiation_mj_m2")) for w in tail),
+                f"Sade viim{n}": sum(_n(w.get("precipitation_mm")) for w in tail),
+                f"ET0 viim{n}": sum(_n(w.get("et0_mm")) for w in tail),
+                f"Niiskus viim{n}": sum(_n(w.get("humidity_avg_pct")) for w in tail) / len(tail),
+            }
+
+        tail1 = _tail_weather(1)
+        tail2 = _tail_weather(2)
+        tail3 = _tail_weather(3)
 
         training_rows.append({
             "Kuupäev": sample["current_day"],
             "Põld": sample["field_no"],
             "Intervall p": sample["interval_days"],
             "Saak": target_total,
+            "ABC saak": target_abc,
+            "Eelmine ABC": previous_abc,
             "Eelmine saak": previous_total,
             "XL -1": previous_xl,
             "XL -2": previous2_xl,
@@ -705,6 +744,15 @@ with tabs[3]:
             "B": current_row.get("b"),
             "C": current_row.get("c"),
             "XL": current_row.get("xl"),
+            # Jäljeotsija kandidaadid. Neid ei näidata põhitabelis ega kasutata baasmudelis.
+            "Eelmine2 ABC": previous2_abc,
+            "ABC trend": yield_trend,
+            "Eelmine2 saak": previous2_total,
+            "XL osakaal -1": previous_xl_share,
+            "XL osakaal -2": previous2_xl_share,
+            "C/B -1": previous_cb,
+            "C/B -2": previous2_cb,
+            **tail1, **tail2, **tail3,
             "Andmekvaliteet": current_row.get("data_quality") or "",
         })
 
@@ -713,14 +761,20 @@ with tabs[3]:
         t1, t2, t3 = st.columns(3)
         t1.metric("Valmis õppimisridu", len(training_df))
         t2.metric("Keskmine intervall", f"{training_df['Intervall p'].mean():.1f} p")
-        t3.metric("Keskmine saak", f"{training_df['Saak'].mean():.1f} kasti")
+        t3.metric("Keskmine A+B+C", f"{training_df['ABC saak'].mean():.1f} kasti")
 
-        display_df = training_df.copy()
+        visible_training_cols = [
+            "Kuupäev", "Põld", "Intervall p", "ABC saak", "XL", "Saak", "Eelmine ABC",
+            "T kesk", "Radiatsioon Σ", "Radiatsioon/p", "Sademed Σ",
+            "Niiskus kesk", "ET0 Σ", "Tuul kesk", "A", "B", "C", "XL", "Andmekvaliteet",
+        ]
+        display_df = training_df[visible_training_cols].copy()
         display_df["Kuupäev"] = display_df["Kuupäev"].map(lambda d: d.strftime("%d.%m"))
         st.dataframe(
             display_df.style.format({
+                "ABC saak": "{:.1f}",
                 "Saak": "{:.1f}",
-                "Eelmine saak": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                "Eelmine ABC": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
                 "XL -1": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
                 "XL -2": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
                 "T kesk": "{:.1f}",
@@ -741,7 +795,7 @@ with tabs[3]:
 
         st.caption(
             "Radiatsioon Σ, sademed Σ ja ET0 Σ on kogu korjevahemiku summad; T, niiskus ja tuul on "
-            "sama vahemiku päevade keskmised. Eelmine saak on nähtaval võrdluseks, mitte kohustuslik põhisisend."
+            "sama vahemiku päevade keskmised. Põhimudeli siht on A+B+C; XL käsitletakse eraldi mürasema korjejäägi komponendina."
         )
 
         csv_df = training_df.copy()
@@ -753,253 +807,485 @@ with tabs[3]:
             mime="text/csv",
         )
 
-        st.markdown("##### Kogusaagi testmudel")
+        st.markdown("##### A+B+C põhimudel + eraldi XL-komponent")
         st.caption(
-            "Esimene kontrollitav mudel. Hindamine on ajaliselt aus: iga testpäeva prognoos tehakse ainult "
-            "sellele päevale eelnenud korjetest õpitud mudeliga. Sama või hilisema päeva tegelikke saake "
-            "testprognoosi treenimisel ei kasutata."
+            "Põhimudel ennustab ainult A+B+C saaki, mis on taime tootmise objektiivsem osa. "
+            "XL prognoositakse eraldi mürasema korjejäägi komponendina. Mõlemat hinnatakse ajaliselt ausa walk-forward testiga."
         )
 
-        # Väikese andmestiku jaoks kasutame regulaaritud lineaarset mudelit (ridge).
-        # Põld läheb sisse eraldi one-hot tunnusena; ilm ja intervall on pidevad tunnused.
-        # A/B/C/XL EI ole mudeli sisendid — need on ainult tegeliku korje tulemused.
-        continuous_cols = [
+        base_cont_cols = [
             "Intervall p", "T kesk", "Radiatsioon Σ", "Radiatsioon/p",
-            "Sademed Σ", "Niiskus kesk", "ET0 Σ", "Tuul kesk", "Eelmine saak",
+            "Sademed Σ", "Niiskus kesk", "ET0 Σ", "Tuul kesk",
         ]
-
         model_df = training_df.copy().sort_values(["Kuupäev", "Põld"]).reset_index(drop=True)
         fields = model_df["Põld"].astype(int).to_numpy()
-        y = model_df["Saak"].astype(float).to_numpy()
         dates = pd.to_datetime(model_df["Kuupäev"]).dt.date.to_numpy()
-        raw_previous = pd.to_numeric(model_df["Eelmine saak"], errors="coerce").to_numpy(dtype=float)
-
-        # Kõik muud pidevad tunnused peavad õppimisreas olema numbrilised.
-        base_cont_cols = [c for c in continuous_cols if c != "Eelmine saak"]
         X_base = model_df[base_cont_cols].astype(float).to_numpy()
 
-        def _design_matrix(x_cont, field_values, means, scales, prev_missing_values):
-            z = (x_cont - means) / scales
-            field_onehot = np.zeros((len(field_values), 14), dtype=float)
-            for row_i, f in enumerate(field_values):
-                if 1 <= int(f) <= 14:
-                    field_onehot[row_i, int(f) - 1] = 1.0
-            return np.column_stack([
-                np.ones(len(field_values)),
-                z,
-                prev_missing_values,
-                field_onehot,
-            ])
+        y_abc = pd.to_numeric(model_df["ABC saak"], errors="coerce").to_numpy(dtype=float)
+        y_xl = pd.to_numeric(model_df["XL"], errors="coerce").to_numpy(dtype=float)
+        y_total = pd.to_numeric(model_df["Saak"], errors="coerce").to_numpy(dtype=float)
+        raw_prev_abc = pd.to_numeric(model_df["Eelmine ABC"], errors="coerce").to_numpy(dtype=float)
+        raw_prev_total = pd.to_numeric(model_df["Eelmine saak"], errors="coerce").to_numpy(dtype=float)
+        raw_xl1 = pd.to_numeric(model_df["XL -1"], errors="coerce").to_numpy(dtype=float)
+        raw_xl2 = pd.to_numeric(model_df["XL -2"], errors="coerce").to_numpy(dtype=float)
 
-        def _fit_predict_walk_forward(train_idx, test_idx, alpha=10.0):
-            # Eelmise saagi puuduva väärtuse täide arvutatakse AINULT treeningandmetest.
-            # Nii ei leki testrea info treeningusse.
-            train_prev = raw_previous[train_idx]
-            finite_train_prev = train_prev[np.isfinite(train_prev)]
-            prev_fill = float(np.median(finite_train_prev)) if len(finite_train_prev) else 0.0
-
-            train_prev_missing = (~np.isfinite(train_prev)).astype(float)
-            test_prev = raw_previous[test_idx]
-            test_prev_missing = (~np.isfinite(test_prev)).astype(float)
-
-            train_prev_filled = np.where(np.isfinite(train_prev), train_prev, prev_fill)
-            test_prev_filled = np.where(np.isfinite(test_prev), test_prev, prev_fill)
-
-            x_train = np.column_stack([X_base[train_idx], train_prev_filled])
-            x_test = np.column_stack([X_base[test_idx], test_prev_filled])
-
-            means = x_train.mean(axis=0)
-            scales = x_train.std(axis=0)
+        def _build_ridge_design(train_idx, test_idx, extra_arrays):
+            tr_parts = [X_base[train_idx]]
+            te_parts = [X_base[test_idx]]
+            tr_missing_parts, te_missing_parts = [], []
+            fills = []
+            for arr in extra_arrays:
+                tr = arr[train_idx]
+                te = arr[test_idx]
+                finite = tr[np.isfinite(tr)]
+                fill = float(np.median(finite)) if len(finite) else 0.0
+                fills.append(fill)
+                tr_parts.append(np.where(np.isfinite(tr), tr, fill).reshape(-1, 1))
+                te_parts.append(np.where(np.isfinite(te), te, fill).reshape(-1, 1))
+                tr_missing_parts.append((~np.isfinite(tr)).astype(float).reshape(-1, 1))
+                te_missing_parts.append((~np.isfinite(te)).astype(float).reshape(-1, 1))
+            xtr = np.column_stack(tr_parts)
+            xte = np.column_stack(te_parts)
+            means = xtr.mean(axis=0)
+            scales = xtr.std(axis=0)
             scales[scales < 1e-9] = 1.0
+            ztr = (xtr - means) / scales
+            zte = (xte - means) / scales
+            ftr = np.zeros((len(train_idx), 14), dtype=float)
+            fte = np.zeros((len(test_idx), 14), dtype=float)
+            for ri, f in enumerate(fields[train_idx]):
+                if 1 <= int(f) <= 14:
+                    ftr[ri, int(f) - 1] = 1.0
+            for ri, f in enumerate(fields[test_idx]):
+                if 1 <= int(f) <= 14:
+                    fte[ri, int(f) - 1] = 1.0
+            tr_missing = np.column_stack(tr_missing_parts) if tr_missing_parts else np.empty((len(train_idx), 0))
+            te_missing = np.column_stack(te_missing_parts) if te_missing_parts else np.empty((len(test_idx), 0))
+            Xtr = np.column_stack([np.ones(len(train_idx)), ztr, tr_missing, ftr])
+            Xte = np.column_stack([np.ones(len(test_idx)), zte, te_missing, fte])
+            return Xtr, Xte, means, scales, fills
 
-            Xtr = _design_matrix(
-                x_train, fields[train_idx], means, scales, train_prev_missing
-            )
-            Xte = _design_matrix(
-                x_test, fields[test_idx], means, scales, test_prev_missing
-            )
-
-            # Intercepti ei karistata; ülejäänud kordajad saavad ridge-regularisatsiooni.
+        def _ridge_walk_predict(target, extra_arrays, train_idx, test_idx, alpha=10.0):
+            Xtr, Xte, _, _, _ = _build_ridge_design(train_idx, test_idx, extra_arrays)
             penalty = np.eye(Xtr.shape[1]) * alpha
             penalty[0, 0] = 0.0
-            beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ y[train_idx]
-            pred = Xte @ beta
-            # Kastide arv ei saa olla negatiivne.
-            return np.maximum(pred, 0.0)
+            beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ target[train_idx]
+            return np.maximum(Xte @ beta, 0.0)
 
-        # Aus walk-forward test: ühe kuupäeva kõik põllud hoitakse korraga testis
-        # ning treeningusse lähevad ainult VARASEMAD kuupäevad.
-        predictions = np.full(len(model_df), np.nan, dtype=float)
         min_train_rows = 10
+        abc_predictions = np.full(len(model_df), np.nan, dtype=float)
+        xl_predictions = np.full(len(model_df), np.nan, dtype=float)
         for test_day in sorted(set(dates)):
             test_idx = np.where(dates == test_day)[0]
             train_idx = np.where(dates < test_day)[0]
             if len(train_idx) < min_train_rows:
                 continue
-            predictions[test_idx] = _fit_predict_walk_forward(train_idx, test_idx)
+            abc_predictions[test_idx] = _ridge_walk_predict(y_abc, [raw_prev_abc], train_idx, test_idx)
+            # XL-mudel saab kasutada varasemaid XL-e ning eelmise korje ABC/kogusaaki.
+            xl_predictions[test_idx] = _ridge_walk_predict(
+                y_xl, [raw_xl1, raw_xl2, raw_prev_abc, raw_prev_total], train_idx, test_idx
+            )
 
-        valid_pred = np.isfinite(predictions)
-        if valid_pred.any():
-            errors = predictions - y
-            mae = float(np.mean(np.abs(errors[valid_pred])))
-            bias = float(np.mean(errors[valid_pred]))
-            rmse = float(np.sqrt(np.mean(errors[valid_pred] ** 2)))
-            within_2 = float(np.mean(np.abs(errors[valid_pred]) <= 2.0) * 100.0)
+        valid_abc = np.isfinite(abc_predictions)
+        valid_xl = np.isfinite(xl_predictions)
+        valid_both = valid_abc & valid_xl
+        predictions = abc_predictions  # Jäljeotsija baasiks jääb objektiivne A+B+C mudel.
+        y = y_abc
+        raw_previous = raw_prev_abc
+        valid_pred = valid_abc
+        current_test_mae = None
+        current_total_test_mae = None
 
-            # Aus baasvõrdlus täpselt samadel testiridadel: järgmine saak = eelmine sama põllu saak.
-            baseline_mask = valid_pred & np.isfinite(raw_previous)
-            baseline_mae = None
-            model_mae_same_rows = None
-            if baseline_mask.any():
-                baseline_mae = float(np.mean(np.abs(raw_previous[baseline_mask] - y[baseline_mask])))
-                model_mae_same_rows = float(np.mean(np.abs(predictions[baseline_mask] - y[baseline_mask])))
+        if valid_abc.any():
+            abc_err = abc_predictions - y_abc
+            abc_mae = float(np.mean(np.abs(abc_err[valid_abc])))
+            current_test_mae = abc_mae
+            abc_rmse = float(np.sqrt(np.mean(abc_err[valid_abc] ** 2)))
+            abc_bias = float(np.mean(abc_err[valid_abc]))
+            abc_within2 = float(np.mean(np.abs(abc_err[valid_abc]) <= 2.0) * 100.0)
+
+            xl_mae = float(np.mean(np.abs(xl_predictions[valid_xl] - y_xl[valid_xl]))) if valid_xl.any() else None
+            total_predictions = abc_predictions + xl_predictions
+            if valid_both.any():
+                total_err = total_predictions - y_total
+                total_mae = float(np.mean(np.abs(total_err[valid_both])))
+                current_total_test_mae = total_mae
+            else:
+                total_mae = None
 
             r1, r2, r3, r4 = st.columns(4)
-            r1.metric("Walk-forward MAE", f"{mae:.1f} kasti")
-            r2.metric("RMSE", f"{rmse:.1f} kasti")
-            r3.metric("Keskmine nihe", f"{bias:+.1f} kasti")
-            r4.metric("±2 kasti sees", f"{within_2:.0f}%")
-
+            r1.metric("A+B+C MAE", f"{abc_mae:.1f} kasti")
+            r2.metric("XL MAE", "—" if xl_mae is None else f"{xl_mae:.1f} kasti")
+            r3.metric("Kogu MAE", "—" if total_mae is None else f"{total_mae:.1f} kasti")
+            r4.metric("A+B+C ±2 sees", f"{abc_within2:.0f}%")
             st.caption(
-                f"Ausalt testitud ridu: {int(valid_pred.sum())}/{len(model_df)}. "
-                f"Varasemad read jäid testist välja, kuni enne testpäeva oli vähemalt {min_train_rows} õppimisrida."
+                f"A+B+C testitud ridu: {int(valid_abc.sum())}/{len(model_df)} · RMSE {abc_rmse:.1f} · nihe {abc_bias:+.1f}. "
+                "Kogu = A+B+C prognoos + eraldi XL prognoos."
             )
 
-            if baseline_mae is not None and model_mae_same_rows is not None:
-                delta = baseline_mae - model_mae_same_rows
+            baseline_mask = valid_abc & np.isfinite(raw_prev_abc)
+            if baseline_mask.any():
+                baseline_mae = float(np.mean(np.abs(raw_prev_abc[baseline_mask] - y_abc[baseline_mask])))
+                model_same = float(np.mean(np.abs(abc_predictions[baseline_mask] - y_abc[baseline_mask])))
+                delta = baseline_mae - model_same
                 if delta > 0:
-                    st.success(
-                        f"Samadel testiridadel: mudeli MAE {model_mae_same_rows:.1f} kasti vs "
-                        f"lihtne 'eelmine saak' {baseline_mae:.1f} kasti. "
-                        f"Mudeli eelis praeguses valimis: {delta:.1f} kasti."
-                    )
+                    st.success(f"A+B+C mudel: MAE {model_same:.1f} vs lihtne 'eelmine A+B+C' {baseline_mae:.1f}. Eelis {delta:.1f} kasti.")
                 else:
-                    st.warning(
-                        f"Samadel testiridadel: mudeli MAE {model_mae_same_rows:.1f} kasti vs "
-                        f"lihtne 'eelmine saak' {baseline_mae:.1f} kasti. "
-                        "Praeguse väikese valimiga ei ole mudel veel baasreeglist parem."
-                    )
+                    st.warning(f"A+B+C mudel: MAE {model_same:.1f} vs lihtne 'eelmine A+B+C' {baseline_mae:.1f}. Baas on praegu parem.")
 
-            # --- XL-mälu kontrollkatse -------------------------------------------------
-            # XL on mürane tunnus (korje/sorteerimise kvaliteet mõjutab mõõdetud arvu),
-            # seega me EI asenda baasmodelli. Võrdleme sama walk-forward skeemi peal,
-            # kas ainult varasemate korjete XL (-1 ja -2) annab päriselt lisainfot.
-            raw_xl1 = pd.to_numeric(model_df["XL -1"], errors="coerce").to_numpy(dtype=float)
-            raw_xl2 = pd.to_numeric(model_df["XL -2"], errors="coerce").to_numpy(dtype=float)
-
-            def _fit_predict_walk_forward_xl(train_idx, test_idx, alpha=10.0):
-                train_prev = raw_previous[train_idx]
-                finite_train_prev = train_prev[np.isfinite(train_prev)]
-                prev_fill = float(np.median(finite_train_prev)) if len(finite_train_prev) else 0.0
-                train_prev_missing = (~np.isfinite(train_prev)).astype(float)
-                test_prev = raw_previous[test_idx]
-                test_prev_missing = (~np.isfinite(test_prev)).astype(float)
-                train_prev_filled = np.where(np.isfinite(train_prev), train_prev, prev_fill)
-                test_prev_filled = np.where(np.isfinite(test_prev), test_prev, prev_fill)
-
-                def _fill_from_train(train_values, test_values):
-                    finite = train_values[np.isfinite(train_values)]
-                    fill = float(np.median(finite)) if len(finite) else 0.0
-                    return (
-                        np.where(np.isfinite(train_values), train_values, fill),
-                        np.where(np.isfinite(test_values), test_values, fill),
-                        (~np.isfinite(train_values)).astype(float),
-                        (~np.isfinite(test_values)).astype(float),
-                    )
-
-                tr_xl1, te_xl1, tr_m1, te_m1 = _fill_from_train(raw_xl1[train_idx], raw_xl1[test_idx])
-                tr_xl2, te_xl2, tr_m2, te_m2 = _fill_from_train(raw_xl2[train_idx], raw_xl2[test_idx])
-
-                x_train = np.column_stack([X_base[train_idx], train_prev_filled, tr_xl1, tr_xl2])
-                x_test = np.column_stack([X_base[test_idx], test_prev_filled, te_xl1, te_xl2])
-                means = x_train.mean(axis=0)
-                scales = x_train.std(axis=0)
-                scales[scales < 1e-9] = 1.0
-
-                # Sama disain nagu baasmudelil, aga lisaks XL puudumise indikaatorid.
-                ztr = (x_train - means) / scales
-                zte = (x_test - means) / scales
-                ftr = np.zeros((len(train_idx), 14), dtype=float)
-                fte = np.zeros((len(test_idx), 14), dtype=float)
-                for ri, f in enumerate(fields[train_idx]):
-                    if 1 <= int(f) <= 14:
-                        ftr[ri, int(f)-1] = 1.0
-                for ri, f in enumerate(fields[test_idx]):
-                    if 1 <= int(f) <= 14:
-                        fte[ri, int(f)-1] = 1.0
-                Xtr = np.column_stack([np.ones(len(train_idx)), ztr, train_prev_missing, tr_m1, tr_m2, ftr])
-                Xte = np.column_stack([np.ones(len(test_idx)), zte, test_prev_missing, te_m1, te_m2, fte])
-
-                penalty = np.eye(Xtr.shape[1]) * alpha
-                penalty[0, 0] = 0.0
-                beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ y[train_idx]
-                return np.maximum(Xte @ beta, 0.0)
-
-            predictions_xl = np.full(len(model_df), np.nan, dtype=float)
-            for test_day in sorted(set(dates)):
-                test_idx = np.where(dates == test_day)[0]
-                train_idx = np.where(dates < test_day)[0]
-                if len(train_idx) < min_train_rows:
-                    continue
-                predictions_xl[test_idx] = _fit_predict_walk_forward_xl(train_idx, test_idx)
-
-            same_mask = np.isfinite(predictions) & np.isfinite(predictions_xl)
-            if same_mask.any():
-                base_mae_xlcmp = float(np.mean(np.abs(predictions[same_mask] - y[same_mask])))
-                xl_mae = float(np.mean(np.abs(predictions_xl[same_mask] - y[same_mask])))
-                xl_delta = base_mae_xlcmp - xl_mae
-                st.markdown("###### XL-mälu kontrollkatse")
-                x1, x2, x3 = st.columns(3)
-                x1.metric("Baas MAE", f"{base_mae_xlcmp:.2f} kasti")
-                x2.metric("Baas + XL(-1,-2)", f"{xl_mae:.2f} kasti")
-                x3.metric("Muutus", f"{xl_delta:+.2f} kasti")
-                if xl_delta >= 0.15:
-                    st.success("XL-i kahe eelmise korje mälu parandab praeguses walk-forward testis tulemust. Signaal on olemas, kuid valim on veel väike ja XL ise mürane.")
-                elif xl_delta <= -0.15:
-                    st.warning("XL-i lisamine teeb praeguses walk-forward testis tulemuse halvemaks. Praegu ei tasu XL-i kogusaagimudeli põhisisendiks võtta.")
-                else:
-                    st.info("XL-i lisamine ei muuda praeguse valimi täpsust sisuliselt. Jätame selle jälgimisele, mitte põhisisendiks.")
-                st.caption("Katse kasutab ainult XL-i eelmisest ja üle-eelmisest sama põllu korjest; jooksva korje XL-i ei kasutata. Mõlemad mudelid hinnatakse täpselt samadel ajaliselt ettepoole testitud ridadel.")
-
-            eval_df = model_df[["Kuupäev", "Põld", "Saak", "Eelmine saak", "XL -1", "XL -2"]].copy()
-            eval_df["Prognoos"] = predictions
-            eval_df["Prognoos + XL"] = predictions_xl
-            eval_df["Viga"] = eval_df["Prognoos"] - eval_df["Saak"]
-            eval_df["Viga + XL"] = eval_df["Prognoos + XL"] - eval_df["Saak"]
-            eval_df["|Viga|"] = eval_df["Viga"].abs()
+            eval_df = model_df[["Kuupäev", "Põld", "ABC saak", "XL", "Saak", "Eelmine ABC"]].copy()
+            eval_df["ABC prognoos"] = abc_predictions
+            eval_df["XL prognoos"] = xl_predictions
+            eval_df["Kogu prognoos"] = abc_predictions + xl_predictions
+            eval_df["ABC viga"] = eval_df["ABC prognoos"] - eval_df["ABC saak"]
+            eval_df["Kogu viga"] = eval_df["Kogu prognoos"] - eval_df["Saak"]
             eval_df = eval_df.sort_values(["Kuupäev", "Põld"], ascending=[False, True])
             eval_df["Kuupäev"] = eval_df["Kuupäev"].map(lambda d: d.strftime("%d.%m"))
-
             st.dataframe(
                 eval_df.style.format({
-                    "Saak": "{:.1f}",
-                    "Eelmine saak": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
-                    "XL -1": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
-                    "XL -2": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
-                    "Prognoos": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
-                    "Prognoos + XL": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
-                    "Viga": lambda v: "—" if pd.isna(v) else f"{v:+.1f}",
-                    "Viga + XL": lambda v: "—" if pd.isna(v) else f"{v:+.1f}",
-                    "|Viga|": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
-                }),
-                use_container_width=True,
-                hide_index=True,
+                    "ABC saak": "{:.1f}", "XL": "{:.1f}", "Saak": "{:.1f}",
+                    "Eelmine ABC": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                    "ABC prognoos": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                    "XL prognoos": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                    "Kogu prognoos": lambda v: "—" if pd.isna(v) else f"{v:.1f}",
+                    "ABC viga": lambda v: "—" if pd.isna(v) else f"{v:+.1f}",
+                    "Kogu viga": lambda v: "—" if pd.isna(v) else f"{v:+.1f}",
+                }), use_container_width=True, hide_index=True,
             )
             st.caption(
-                "Viga = prognoos − tegelik. Positiivne tähendab, et mootor ennustas liiga palju. "
-                "Need on ajaliselt ettepoole testitud prognoosid; sama või hilisema kuupäeva saake treeningus ei kasutata."
+                "ABC viga näitab taime tootmise prognoosi viga. Kogu viga sisaldab lisaks XL-komponendi müra. "
+                "XL-mudel on eraldi just selleks, et korjejääk ei moonutaks põhimudelit."
             )
         else:
-            st.info(
-                "Ausaks ajaliseks testiks ei ole veel piisavalt varasemaid õppimisridu. "
-                f"Esimene testpäev tekib, kui enne seda on vähemalt {min_train_rows} täielikku õppimisrida."
+            st.info(f"Ajaliselt ausaks testiks on vaja vähemalt {min_train_rows} varasemat õppimisrida.")
+
+        def _fit_full_generic(target, extra_arrays, alpha=10.0):
+            idx = np.arange(len(model_df))
+            Xtr, _, means, scales, fills = _build_ridge_design(idx, idx, extra_arrays)
+            penalty = np.eye(Xtr.shape[1]) * alpha
+            penalty[0, 0] = 0.0
+            beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ target
+            return {"beta": beta, "means": means, "scales": scales, "fills": fills, "n_extra": len(extra_arrays)}
+
+        def _predict_full_generic(model, field_no, base_values, extra_values):
+            x = list(base_values)
+            miss = []
+            for i, value in enumerate(extra_values):
+                if value is None or not np.isfinite(float(value)):
+                    x.append(model["fills"][i])
+                    miss.append(1.0)
+                else:
+                    x.append(float(value))
+                    miss.append(0.0)
+            x = np.array([x], dtype=float)
+            z = (x - model["means"]) / model["scales"]
+            onehot = np.zeros((1, 14), dtype=float)
+            if 1 <= int(field_no) <= 14:
+                onehot[0, int(field_no) - 1] = 1.0
+            Xp = np.column_stack([np.ones(1), z, np.array([miss], dtype=float), onehot])
+            return float(max(0.0, (Xp @ model["beta"])[0]))
+
+        full_abc_model = _fit_full_generic(y_abc, [raw_prev_abc])
+        full_xl_model = _fit_full_generic(y_xl, [raw_xl1, raw_xl2, raw_prev_abc, raw_prev_total])
+
+        # -------------------------------------------------------------------------
+        # 5 päeva ette: A+B+C + eraldi XL
+        # -------------------------------------------------------------------------
+        st.markdown("##### 5 päeva saagiprognoos")
+        st.caption(
+            "Põhimudel ennustab A+B+C. XL lisatakse eraldi korjejäägi komponendina. "
+            "Korjevahemiku möödunud päevadel kasutatakse mõõdetud ilma ja tulevastel päevadel 9 päeva ilmaprognoosi."
+        )
+
+        future_weather_end = TODAY + timedelta(days=8)
+        all_weather_rows = db.get_weather_rows(readiness_start, future_weather_end)
+        all_weather_by_day = {str(r.get("weather_date")): r for r in all_weather_rows}
+        weather_feature_names = [
+            "temp_min_c", "temp_max_c", "wind_avg_ms", "radiation_mj_m2",
+            "humidity_avg_pct", "precipitation_mm", "et0_mm",
+        ]
+
+        def _nearest_weather_value(day_value, feature):
+            candidates = []
+            for delta in range(1, 4):
+                for dd in (day_value - timedelta(days=delta), day_value + timedelta(days=delta)):
+                    row = all_weather_by_day.get(dd.isoformat())
+                    if row and row.get(feature) is not None:
+                        try:
+                            candidates.append(float(row.get(feature)))
+                        except (TypeError, ValueError):
+                            pass
+                if candidates:
+                    break
+            return float(np.mean(candidates)) if candidates else None
+
+        def _weather_window_for_prediction(previous_day, target_day):
+            rows, estimated_days = [], set()
+            d = previous_day + timedelta(days=1)
+            while d <= target_day:
+                src = all_weather_by_day.get(d.isoformat())
+                if not src:
+                    return None, None
+                clean = {}
+                for feature in weather_feature_names:
+                    value = src.get(feature)
+                    try:
+                        value = float(value) if value is not None else None
+                    except (TypeError, ValueError):
+                        value = None
+                    if value is None:
+                        value = _nearest_weather_value(d, feature)
+                        if value is not None:
+                            estimated_days.add(d)
+                    if value is None:
+                        return None, None
+                    clean[feature] = value
+                rows.append(clean)
+                d += timedelta(days=1)
+            if not rows:
+                return None, None
+            mean_t = [(r["temp_min_c"] + r["temp_max_c"]) / 2 for r in rows]
+            return {
+                "Intervall p": (target_day - previous_day).days,
+                "T kesk": float(np.mean(mean_t)),
+                "Radiatsioon Σ": float(np.sum([r["radiation_mj_m2"] for r in rows])),
+                "Radiatsioon/p": float(np.mean([r["radiation_mj_m2"] for r in rows])),
+                "Sademed Σ": float(np.sum([r["precipitation_mm"] for r in rows])),
+                "Niiskus kesk": float(np.mean([r["humidity_avg_pct"] for r in rows])),
+                "ET0 Σ": float(np.sum([r["et0_mm"] for r in rows])),
+                "Tuul kesk": float(np.mean([r["wind_avg_ms"] for r in rows])),
+            }, estimated_days
+
+        def _predict_one(field_no, state, target_day):
+            wx, estimated_days = _weather_window_for_prediction(state["date"], target_day)
+            if wx is None:
+                return None
+            base_values = [wx[c] for c in base_cont_cols]
+            abc_pred = _predict_full_generic(full_abc_model, field_no, base_values, [state.get("abc")])
+            xl_pred = _predict_full_generic(
+                full_xl_model, field_no, base_values,
+                [state.get("xl"), state.get("xl_prev"), state.get("abc"), state.get("total")],
             )
+            return {
+                "abc": abc_pred, "xl": xl_pred, "total": abc_pred + xl_pred,
+                "interval": wx["Intervall p"], "estimated_days": estimated_days or set(),
+            }
+
+        field_state = {}
+        for row in sorted(harvest_rows, key=lambda r: (str(r.get("harvest_date") or ""), int(r.get("harvest_order") or 99))):
+            try:
+                d = date.fromisoformat(str(row.get("harvest_date")))
+                f = int(row.get("field_no"))
+                a = float(row.get("a")); b = float(row.get("b")); c = float(row.get("c")); xl = float(row.get("xl"))
+                total_value = float(row.get("total"))
+            except (TypeError, ValueError):
+                continue
+            if d <= TODAY:
+                old = field_state.get(f)
+                field_state[f] = {
+                    "date": d, "abc": a + b + c, "xl": xl, "xl_prev": old.get("xl") if old else None,
+                    "total": total_value, "source": "tegelik",
+                }
+
+        today_rows_live = db.get_harvest_for_day(TODAY)
+        today_plan = _planned_fields_for_day(TODAY, today_rows_live, harvest_rows)
+        today_actual = {int(r.get("field_no")): r for r in today_rows_live if r.get("field_no") is not None}
+
+        internal_today = []
+        for f in today_plan:
+            actual = today_actual.get(int(f))
+            if actual:
+                try:
+                    old = field_state.get(int(f))
+                    a=float(actual.get("a")); b=float(actual.get("b")); c=float(actual.get("c")); xl=float(actual.get("xl")); total=float(actual.get("total"))
+                    field_state[int(f)] = {
+                        "date": TODAY, "abc": a+b+c, "xl": xl, "xl_prev": old.get("xl") if old else None,
+                        "total": total, "source": "tegelik",
+                    }
+                    continue
+                except (TypeError, ValueError):
+                    pass
+            prev = field_state.get(int(f))
+            if not prev:
+                continue
+            nowcast = _predict_one(int(f), prev, TODAY)
+            if nowcast:
+                field_state[int(f)] = {
+                    "date": TODAY, "abc": nowcast["abc"], "xl": nowcast["xl"], "xl_prev": prev.get("xl"),
+                    "total": nowcast["total"], "source": "prognoos",
+                }
+                internal_today.append((int(f), nowcast["total"]))
+
+        forecast_days = []
+        first_field = _next_field(today_plan[-1]) if today_plan else 1
+        current_first = first_field
+        any_weather_imputation = set()
+        for offset in range(1, 6):
+            target_day = TODAY + timedelta(days=offset)
+            day_fields = [current_first, _next_field(current_first), _next_field(_next_field(current_first))]
+            day_rows = []
+            for f in day_fields:
+                prev = field_state.get(int(f))
+                if not prev:
+                    day_rows.append({"Põld": f, "A+B+C": None, "XL": None, "Kokku": None, "Intervall": None, "Alus": "puudub", "Hinnanguline ilm": "—"})
+                    continue
+                result = _predict_one(int(f), prev, target_day)
+                if not result:
+                    day_rows.append({"Põld": f, "A+B+C": None, "XL": None, "Kokku": None, "Intervall": (target_day-prev["date"]).days, "Alus": prev["source"], "Hinnanguline ilm": "puudub"})
+                    continue
+                any_weather_imputation.update(result["estimated_days"])
+                source_label = "tegelik eelkorje" if prev["source"] == "tegelik" else "prognoositud eelkorje"
+                day_rows.append({
+                    "Põld": f, "A+B+C": result["abc"], "XL": result["xl"], "Kokku": result["total"],
+                    "Intervall": result["interval"], "Alus": source_label,
+                    "Hinnanguline ilm": ", ".join(sorted(d.strftime("%d.%m") for d in result["estimated_days"])) or "—",
+                })
+                field_state[int(f)] = {
+                    "date": target_day, "abc": result["abc"], "xl": result["xl"], "xl_prev": prev.get("xl"),
+                    "total": result["total"], "source": "prognoos",
+                }
+            forecast_days.append((target_day, day_rows))
+            current_first = _next_field(day_fields[-1])
+
+        if internal_today:
+            st.caption("Tänase poolelioleva korje sisemine tööprognoos: " + ", ".join(f"põld {f} ≈ {p:.1f}" for f,p in internal_today) + ". Tegelik kirje asendab selle automaatselt.")
+        if any_weather_imputation:
+            st.warning("⚠️ Puuduva mõõdetud ilma väärtusi täideti ajutiselt lähimate päevade keskmisega: " + ", ".join(sorted(d.strftime("%d.%m") for d in any_weather_imputation)) + ".")
+
+        for target_day, rows_day in forecast_days:
+            vals = [r["Kokku"] for r in rows_day if r["Kokku"] is not None]
+            total_day = sum(vals) if len(vals) == 3 else None
+            total_text = f"{_fmt(total_day)} kasti" if total_day is not None else "prognoos puudulik"
+            st.markdown(f"### {_short_date(target_day)}  {total_text}")
+            day_df = pd.DataFrame(rows_day)
+            st.dataframe(day_df.style.format({
+                "A+B+C": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
+                "XL": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
+                "Kokku": lambda v: "—" if pd.isna(v) else f"{float(v):.1f}",
+                "Intervall": lambda v: "—" if pd.isna(v) else f"{int(v)} p",
+            }), use_container_width=True, hide_index=True)
+
+        abc_mae_text = f"{current_test_mae:.1f} kasti/põld" if current_test_mae is not None else "veel hindamata"
+        total_mae_text = f"{current_total_test_mae:.1f} kasti/põld" if current_total_test_mae is not None else "veel hindamata"
+        st.caption(f"A+B+C ajaline testviga: {abc_mae_text}. Kogusaagi (ABC+XL) testviga: {total_mae_text}. Kaugematel päevadel kasvab ebakindlus rekursiivse eelkorje tõttu.")
+
+        # -------------------------------------------------------------------------
+        # Jäljeotsija v1 — automaatne tunnusegruppide kontroll
+        # -------------------------------------------------------------------------
+        if valid_pred.any():
+            st.markdown("##### Jäljeotsija v1")
+            st.caption(
+                "Mootor proovib ise lisatunnuste gruppe. Iga katse hinnatakse sama ajaliselt ettepoole "
+                "walk-forward skeemiga. Positiivne paranemine tähendab väiksemat MAE-d kui baasmudelil."
+            )
+
+            candidate_groups = {
+                "A+B+C trend 2 korjet": ["Eelmine2 ABC", "ABC trend"],
+                "Korjejääk / kõrge eelkorje": ["Eelmine saak", "XL -1", "XL -2", "XL osakaal -1", "XL osakaal -2"],
+                "C/B mälu 2 korjet": ["C/B -1", "C/B -2"],
+                "XL osakaal 2 korjet": ["XL osakaal -1", "XL osakaal -2"],
+                "Viimase 1 päeva ilm": ["T viim1", "Rad viim1", "Sade viim1", "ET0 viim1", "Niiskus viim1"],
+                "Viimase 2 päeva ilm": ["T viim2", "Rad viim2", "Sade viim2", "ET0 viim2", "Niiskus viim2"],
+                "Viimase 3 päeva ilm": ["T viim3", "Rad viim3", "Sade viim3", "ET0 viim3", "Niiskus viim3"],
+            }
+
+            def _walk_forward_with_extra(extra_cols, alpha=10.0):
+                raw_extra = model_df[extra_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+                preds = np.full(len(model_df), np.nan, dtype=float)
+                for test_day in sorted(set(dates)):
+                    test_idx = np.where(dates == test_day)[0]
+                    train_idx = np.where(dates < test_day)[0]
+                    if len(train_idx) < min_train_rows:
+                        continue
+
+                    train_prev = raw_previous[train_idx]
+                    finite_prev = train_prev[np.isfinite(train_prev)]
+                    prev_fill = float(np.median(finite_prev)) if len(finite_prev) else 0.0
+                    tr_prev_missing = (~np.isfinite(train_prev)).astype(float)
+                    te_prev = raw_previous[test_idx]
+                    te_prev_missing = (~np.isfinite(te_prev)).astype(float)
+                    tr_prev = np.where(np.isfinite(train_prev), train_prev, prev_fill)
+                    te_prev = np.where(np.isfinite(te_prev), te_prev, prev_fill)
+
+                    tr_extra_parts, te_extra_parts, tr_missing_parts, te_missing_parts = [], [], [], []
+                    for j in range(raw_extra.shape[1]):
+                        tr_col = raw_extra[train_idx, j]
+                        te_col = raw_extra[test_idx, j]
+                        finite = tr_col[np.isfinite(tr_col)]
+                        fill = float(np.median(finite)) if len(finite) else 0.0
+                        tr_extra_parts.append(np.where(np.isfinite(tr_col), tr_col, fill))
+                        te_extra_parts.append(np.where(np.isfinite(te_col), te_col, fill))
+                        tr_missing_parts.append((~np.isfinite(tr_col)).astype(float))
+                        te_missing_parts.append((~np.isfinite(te_col)).astype(float))
+
+                    tr_extra = np.column_stack(tr_extra_parts) if tr_extra_parts else np.empty((len(train_idx), 0))
+                    te_extra = np.column_stack(te_extra_parts) if te_extra_parts else np.empty((len(test_idx), 0))
+                    tr_miss = np.column_stack(tr_missing_parts) if tr_missing_parts else np.empty((len(train_idx), 0))
+                    te_miss = np.column_stack(te_missing_parts) if te_missing_parts else np.empty((len(test_idx), 0))
+
+                    xtr = np.column_stack([X_base[train_idx], tr_prev, tr_extra])
+                    xte = np.column_stack([X_base[test_idx], te_prev, te_extra])
+                    means = xtr.mean(axis=0)
+                    scales = xtr.std(axis=0)
+                    scales[scales < 1e-9] = 1.0
+                    ztr = (xtr - means) / scales
+                    zte = (xte - means) / scales
+                    ftr = np.zeros((len(train_idx), 14), dtype=float)
+                    fte = np.zeros((len(test_idx), 14), dtype=float)
+                    for ri, f in enumerate(fields[train_idx]):
+                        if 1 <= int(f) <= 14: ftr[ri, int(f)-1] = 1.0
+                    for ri, f in enumerate(fields[test_idx]):
+                        if 1 <= int(f) <= 14: fte[ri, int(f)-1] = 1.0
+                    Xtr = np.column_stack([np.ones(len(train_idx)), ztr, tr_prev_missing, tr_miss, ftr])
+                    Xte = np.column_stack([np.ones(len(test_idx)), zte, te_prev_missing, te_miss, fte])
+                    penalty = np.eye(Xtr.shape[1]) * alpha
+                    penalty[0, 0] = 0.0
+                    beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ y[train_idx]
+                    preds[test_idx] = np.maximum(Xte @ beta, 0.0)
+                return preds
+
+            trace_results = []
+            for name, cols in candidate_groups.items():
+                candidate_pred = _walk_forward_with_extra(cols)
+                mask = np.isfinite(predictions) & np.isfinite(candidate_pred)
+                if not mask.any():
+                    continue
+                base_same = float(np.mean(np.abs(predictions[mask] - y[mask])))
+                candidate_mae = float(np.mean(np.abs(candidate_pred[mask] - y[mask])))
+                trace_results.append({
+                    "Jälg": name,
+                    "Baas MAE": base_same,
+                    "Katse MAE": candidate_mae,
+                    "Paranemine": base_same - candidate_mae,
+                    "Testiridu": int(mask.sum()),
+                })
+
+            trace_df = pd.DataFrame(trace_results).sort_values("Paranemine", ascending=False)
+            if not trace_df.empty:
+                st.dataframe(
+                    trace_df.style.format({
+                        "Baas MAE": "{:.2f}", "Katse MAE": "{:.2f}", "Paranemine": "{:+.2f}",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
+                best = trace_df.iloc[0]
+                if float(best["Paranemine"]) >= 0.15:
+                    st.success(
+                        f"Praegu tugevaim jälg: {best['Jälg']} — MAE paranemine {float(best['Paranemine']):.2f} kasti. "
+                        "See on kandidaat edasiseks jälgimiseks, mitte veel automaatselt mudelisse lukustatud tunnus."
+                    )
+                else:
+                    st.info(
+                        "Praeguse väikese valimi pealt ei leidnud Jäljeotsija veel piisavalt tugevat stabiilset lisatunnust. "
+                        "Uute korjetega test muutub iga päev informatiivsemaks."
+                    )
     else:
         st.info("Täieliku ilmavahemiku ja numbrilise saagiga õppimisridu ei ole veel piisavalt.")
 
     st.markdown("##### Mida mudel hiljem sellest kasutab")
     st.write(
-        "Iga õppimisnäite siht on konkreetse põllu järgmine saak. Sisenditesse saab sellest ilmavahemikust "
+        "Põhimudeli õppimisnäite siht on konkreetse põllu järgmise korje A+B+C. XL õpitakse eraldi korjejäägi komponendina. Sisenditesse saab ilmavahemikust "
         "arvutada näiteks temperatuuri, radiatsiooni, sademete, õhuniiskuse ja ET0 summad/keskmised ning "
         "korjeintervalli. Eelmise korje saak võib olla üks lisatunnus, kuid ei ole prognoosi põhialus."
     )
@@ -1010,7 +1296,7 @@ with tabs[3]:
         )
 
     st.divider()
-    st.info("Järgmine samm pärast rohelist valmisolekut: ehitada nendest õppimisnäidetest esimene põllupõhine kogusaagi mudel.")
+    st.info("Mudel töötab nüüd kahekihiliselt: objektiivsem A+B+C põhimudel + eraldi XL-komponent. Jäljeotsija hindab jooksvalt, millised lisatunnused A+B+C prognoosi päriselt parandavad.")
 
 with tabs[4]:
     st.subheader("Mootori tähelepanekud")
