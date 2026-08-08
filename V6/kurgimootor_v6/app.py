@@ -324,123 +324,93 @@ with tabs[0]:
     harvest_history_for_plan = db.get_harvest_history()
     today_planned_fields = _planned_fields_for_day(TODAY, today_rows, harvest_history_for_plan)
 
-    # Uue päeva alguses lähtuvad kõik tänase vaate osad samast põlluplaanist.
     current_home_day = TODAY.isoformat()
     if st.session_state.get("home_plan_day") != current_home_day:
         st.session_state["home_plan_day"] = current_home_day
         st.session_state["home_today_fields"] = list(today_planned_fields)
 
-    if len(today_planned_fields) >= 2:
-        fields_text = ", ".join(str(f) for f in today_planned_fields[:-1]) + f" ja {today_planned_fields[-1]}"
-    elif today_planned_fields:
-        fields_text = str(today_planned_fields[0])
+    selected_today_fields = st.multiselect(
+        "Täna korjatavad põllud",
+        options=list(range(1, 15)),
+        key="home_today_fields",
+        max_selections=4,
+        help="Muuda ainult tänase tööplaani. Saagi sisestamine käib Korjed-menüüs.",
+    )
+
+    if selected_today_fields:
+        if len(selected_today_fields) >= 2:
+            fields_text = ", ".join(str(f) for f in selected_today_fields[:-1]) + f" ja {selected_today_fields[-1]}"
+        else:
+            fields_text = str(selected_today_fields[0])
+        plan_text = f"Täna korjatakse põllud nr {fields_text}"
     else:
-        fields_text = "—"
+        plan_text = "Täna korjet ei ole"
 
     st.markdown(
         f"""
-        <div style="display:flex;justify-content:space-between;align-items:end;gap:16px;margin-bottom:8px;">
-          <div>
-            <div style="font-size:1.15rem;font-weight:650;opacity:.82;">Täna korjatakse põllud nr {fields_text}</div>
-            <div style="font-size:2.15rem;font-weight:900;line-height:1.05;margin-top:4px;">{_short_date(TODAY)}</div>
-          </div>
-          <div style="font-size:3.4rem;font-weight:950;line-height:1;opacity:.22;">{_weekday_letter(TODAY)}</div>
+        <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:4px;">
+          <span style="font-size:2.0rem;font-weight:950;opacity:.35;">{_weekday_letter(TODAY)}</span>
+          <span style="font-size:2.15rem;font-weight:900;line-height:1.05;">{_short_date(TODAY)}</span>
         </div>
+        <div style="font-size:1.10rem;font-weight:650;opacity:.82;margin-bottom:10px;">{plan_text}</div>
         """,
         unsafe_allow_html=True,
     )
 
-    # Avaleht = tänane töö + tänane prognoos. Analüütilised detailid jäävad Prognoos-menüüsse.
-    home_left, home_right = st.columns([1.55, 1.0], gap="large")
-
-    with home_left:
-        st.markdown("#### Tänane korje")
-        selected_today_fields = st.multiselect(
-            "Täna korjatavad põllud",
-            options=list(range(1, 15)),
-            key="home_today_fields",
-            help="Vaikimisi tänase plaani põllud. Kui täna korjatakse ainult 2, eemalda kolmas.",
-        )
-        if len(selected_today_fields) > 3:
-            st.warning("Vali tänaseks kuni 3 põldu.")
-            selected_today_fields = selected_today_fields[:3]
-
-        today_by_field = {int(r.get("field_no")): r for r in today_rows if r.get("field_no") is not None}
-        for order_idx, field_no in enumerate(selected_today_fields, start=1):
-            existing = today_by_field.get(int(field_no), {})
-            with st.form(f"home_harvest_field_{field_no}", border=True):
-                st.markdown(f"**Põld {field_no}**")
-                a1, a2, a3, a4 = st.columns(4)
-                home_a = a1.number_input(
-                    "A", min_value=0.0, step=0.1, format="%.1f",
-                    value=float(existing.get("a") or 0.0), key=f"home_a_{field_no}"
-                )
-                home_b = a2.number_input(
-                    "B", min_value=0.0, step=0.1, format="%.1f",
-                    value=float(existing.get("b") or 0.0), key=f"home_b_{field_no}"
-                )
-                home_c = a3.number_input(
-                    "C", min_value=0.0, step=0.1, format="%.1f",
-                    value=float(existing.get("c") or 0.0), key=f"home_c_{field_no}"
-                )
-                home_xl = a4.number_input(
-                    "XL", min_value=0.0, step=0.1, format="%.1f",
-                    value=float(existing.get("xl") or 0.0), key=f"home_xl_{field_no}"
-                )
-                home_total = home_a + home_b + home_c + home_xl
-                home_cb = (home_c / home_b) if home_b > 0 else None
-                home_summary = f"Kokku {_fmt(home_total)}"
-                if home_cb is not None:
-                    home_summary += f" · C/B {_fmt(home_cb, 2)}"
-                st.caption(home_summary)
-
-                button_label = "Paranda" if existing else "Salvesta"
-                if st.form_submit_button(button_label, use_container_width=True):
-                    if home_total <= 0:
-                        st.warning("Korje kogus on 0.")
-                    else:
-                        db.save_harvest(
-                            TODAY, int(field_no), 0,
-                            home_a, home_b, home_c, home_xl,
-                            harvest_order=order_idx,
-                        )
-                        st.session_state["harvest_saved_message"] = (
-                            f"Salvestatud: põld {field_no} · kokku {_fmt(home_total)}"
-                        )
-                        st.rerun()
-
-        if not selected_today_fields:
-            st.info("Vali vähemalt üks tänane põld.")
-
-        live_rows = [r for r in today_rows if int(r.get("field_no") or 0) in set(selected_today_fields)]
-        if live_rows:
-            actual = _daily_summary(live_rows)
-            actual_cb = "—" if actual["cb"] is None else _fmt(actual["cb"], 2)
-            st.markdown(
-                f"""
-                <div style="border:1px solid rgba(128,128,128,.25);border-radius:12px;padding:12px 14px;margin-top:10px;">
-                  <div style="font-size:.80rem;font-weight:900;letter-spacing:.10em;opacity:.58;">TEGELIK</div>
-                  <div style="font-size:2.15rem;font-weight:900;line-height:1.05;margin-top:3px;">{_fmt(actual['total'])} kasti</div>
-                  <div style="font-size:.92rem;opacity:.74;margin-top:6px;">
-                    A {_fmt(actual['a'])} · B {_fmt(actual['b'])} · C {_fmt(actual['c'])} · XL {_fmt(actual['xl'])} · C/B {actual_cb}
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                """
-                <div style="border:1px solid rgba(128,128,128,.20);border-radius:12px;padding:12px 14px;margin-top:10px;">
-                  <div style="font-size:.80rem;font-weight:900;letter-spacing:.10em;opacity:.58;">TEGELIK</div>
-                  <div style="font-size:2.15rem;font-weight:900;line-height:1.05;margin-top:3px;">0,0 kasti</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    with home_right:
+    today_top_left, today_top_right = st.columns(2, gap="large")
+    with today_top_left:
+        home_today_actual_slot = st.empty()
+    with today_top_right:
         home_today_forecast_slot = st.empty()
+
+    st.markdown("#### Tänased põllud")
+    today_by_field = {int(r.get("field_no")): r for r in today_rows if r.get("field_no") is not None}
+
+    if not selected_today_fields:
+        st.info("Täna korjet ei ole.")
+    else:
+        for field_no in selected_today_fields:
+            row = today_by_field.get(int(field_no))
+            if row:
+                b = _n(row.get("b"))
+                c = _n(row.get("c"))
+                cb = c / b if b > 0 else None
+                cb_text = "—" if cb is None else _fmt(cb, 2)
+                total = _n(row.get("total"))
+                st.markdown(
+                    f"""
+                    <div style="background:rgba(40,167,69,.10);border:1px solid rgba(40,167,69,.38);
+                                border-radius:10px;padding:9px 11px;margin:5px 0;">
+                      <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;">
+                        <strong>Põld {int(field_no)}</strong>
+                        <strong>{_fmt(total)} kasti</strong>
+                      </div>
+                      <div style="font-size:.92rem;opacity:.78;margin-top:3px;">
+                        A {_fmt(_n(row.get('a')))} · B {_fmt(b)} · C {_fmt(c)} · XL {_fmt(_n(row.get('xl')))} · C/B {cb_text}
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f"""
+                    <div style="background:#fff3cd;border:1px solid #ffe69c;
+                                border-radius:10px;padding:9px 11px;margin:5px 0;">
+                      <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;">
+                        <strong>Põld {int(field_no)}</strong>
+                        <strong>korje sisestamata</strong>
+                      </div>
+                      <div style="font-size:.92rem;opacity:.72;margin-top:3px;">
+                        A — · B — · C — · XL — · C/B —
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown("#### Mootori info")
+    home_engine_info_slot = st.empty()
 
     st.divider()
     st.markdown("#### Järgmised päevad")
@@ -2189,11 +2159,9 @@ with tabs[3]:
         today_rows_live = db.get_harvest_for_day(TODAY)
         today_plan_default = _planned_fields_for_day(TODAY, today_rows_live, harvest_rows)
 
-        # Avalehel võib kasutaja tänase 3 põllu valikust ühe eemaldada.
-        # Kui sessionis pole valikut, kasutame automaatset plaani.
         selected_home = st.session_state.get("home_today_fields")
-        if selected_home:
-            today_plan = [int(f) for f in selected_home[:3]]
+        if selected_home is not None:
+            today_plan = [int(f) for f in list(selected_home)[:4]]
         else:
             today_plan = [int(f) for f in today_plan_default]
 
@@ -2343,8 +2311,30 @@ with tabs[3]:
             st.warning(f"Prognoosid arvutatakse, kuid ajaloo salvestamine ebaõnnestus: {exc}")
 
         # --- Avalehe kiire ülevaade ---
-        # Kuvame ainult tööks vajaliku: tänase valitud põldude summa ja päevakoondid.
         try:
+            selected_set = {int(f) for f in today_plan}
+            actual_rows_home = [
+                r for r in today_rows_live
+                if int(r.get("field_no") or 0) in selected_set
+            ]
+            actual_sum = _daily_summary(actual_rows_home) if actual_rows_home else {
+                "total": 0.0, "a": 0.0, "b": 0.0, "c": 0.0, "xl": 0.0, "cb": None
+            }
+            actual_cb_text = "—" if actual_sum["cb"] is None else _fmt(actual_sum["cb"], 2)
+            with home_today_actual_slot.container():
+                st.markdown(
+                    f"""
+                    <div style="border:1px solid rgba(128,128,128,.25);border-radius:12px;padding:12px 14px;">
+                      <div style="font-size:.80rem;font-weight:900;letter-spacing:.10em;opacity:.58;">TEGELIK</div>
+                      <div style="font-size:2.15rem;font-weight:900;line-height:1.05;margin-top:3px;">{_fmt(actual_sum['total'])} kasti</div>
+                      <div style="font-size:.92rem;opacity:.74;margin-top:6px;">
+                        A {_fmt(actual_sum['a'])} · B {_fmt(actual_sum['b'])} · C {_fmt(actual_sum['c'])} · XL {_fmt(actual_sum['xl'])} · C/B {actual_cb_text}
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
             today_vals = [r for r in today_forecast_rows if r.get("Kokku") is not None]
             if today_vals:
                 today_total_fc = sum(float(r["Kokku"]) for r in today_vals)
@@ -2353,15 +2343,14 @@ with tabs[3]:
                 today_cb_vals = [float(r["C/B"]) for r in today_vals if r.get("C/B") is not None]
                 today_cb_fc = float(np.mean(today_cb_vals)) if today_cb_vals else None
                 cb_fc_text = "—" if today_cb_fc is None else _fmt(today_cb_fc, 2)
+
                 with home_today_forecast_slot.container():
-                    st.markdown("#### Tänane prognoos")
                     st.markdown(
                         f"""
-                        <div style="border:2px solid rgba(76,160,92,.38);border-radius:12px;padding:14px 16px;">
+                        <div style="border:2px solid rgba(76,160,92,.38);border-radius:12px;padding:12px 14px;">
                           <div style="font-size:.80rem;font-weight:900;letter-spacing:.10em;opacity:.58;">PROGNOOS</div>
-                          <div style="font-size:2.45rem;font-weight:950;line-height:1.05;margin-top:3px;">{_fmt(today_total_fc)} kasti</div>
-                          <div style="font-size:.94rem;opacity:.76;margin-top:7px;">
-                            põllud {' · '.join(str(f) for f in today_plan)}<br>
+                          <div style="font-size:2.15rem;font-weight:950;line-height:1.05;margin-top:3px;">{_fmt(today_total_fc)} kasti</div>
+                          <div style="font-size:.92rem;opacity:.76;margin-top:6px;">
                             A+B+C {_fmt(today_abc_fc)} · XL {_fmt(today_xl_fc)} · C/B ~{cb_fc_text}
                           </div>
                         </div>
@@ -2370,13 +2359,23 @@ with tabs[3]:
                     )
             else:
                 with home_today_forecast_slot.container():
-                    st.markdown("#### Tänane prognoos")
-                    st.info("Tänast prognoosi ei saanud veel moodustada.")
+                    st.info("Tänast prognoosi ei saanud moodustada.")
+
+            engine_parts = [
+                f"A+B+C mootor: {champion_name}",
+                "XL eraldi",
+                f"C/B mootor: {cb_champion_name}",
+            ]
+            engine_parts.append("ilm osaliselt hinnanguline" if any_weather_imputation else "ilm täielik")
+            if champion_uses_biological_load:
+                engine_parts.append("biokoormus kasutusel")
+            with home_engine_info_slot.container():
+                st.caption(" · ".join(engine_parts))
 
             with home_future_forecast_slot.container():
                 for target_day, rows_day in forecast_days:
                     valid = [r for r in rows_day if r.get("Kokku") is not None]
-                    if len(valid) != 3:
+                    if not valid:
                         continue
                     total_day = sum(float(r["Kokku"]) for r in valid)
                     abc_day = sum(float(r["A+B+C"]) for r in valid if r.get("A+B+C") is not None)
