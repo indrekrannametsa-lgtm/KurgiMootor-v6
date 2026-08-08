@@ -1941,17 +1941,22 @@ with tabs[3]:
         ]
 
         def _nearest_weather_value(day_value, feature):
+            """Ajutine fallback ainult mudeli arvutuseks.
+
+            Minevikupäeva puuduvat väärtust ei täideta tuleviku prognoosiga.
+            Kasutame kuni kolme lähima VARASEMA päeva olemasolevaid väärtusi.
+            Nii saab 3 päeva ilmasisend jätkuda ka siis, kui ametlik Pärnu päev
+            saabub osaliselt. UI märgib sellise päeva hinnanguliseks.
+            """
             candidates = []
             for delta in range(1, 4):
-                for dd in (day_value - timedelta(days=delta), day_value + timedelta(days=delta)):
-                    row = all_weather_by_day.get(dd.isoformat())
-                    if row and row.get(feature) is not None:
-                        try:
-                            candidates.append(float(row.get(feature)))
-                        except (TypeError, ValueError):
-                            pass
-                if candidates:
-                    break
+                dd = day_value - timedelta(days=delta)
+                row = all_weather_by_day.get(dd.isoformat())
+                if row and row.get(feature) is not None:
+                    try:
+                        candidates.append(float(row.get(feature)))
+                    except (TypeError, ValueError):
+                        pass
             return float(np.mean(candidates)) if candidates else None
 
         def _weather_window_for_prediction(previous_day, target_day):
@@ -2440,7 +2445,7 @@ with tabs[3]:
         if internal_today:
             st.caption("Tänase poolelioleva korje sisemine tööprognoos: " + ", ".join(f"põld {f} ≈ {p:.1f}" for f,p in internal_today) + ". Tegelik kirje asendab selle automaatselt.")
         if any_weather_imputation:
-            st.warning("⚠️ Puuduva mõõdetud ilma väärtusi täideti ajutiselt lähimate päevade keskmisega: " + ", ".join(sorted(d.strftime("%d.%m") for d in any_weather_imputation)) + ".")
+            st.warning("⚠️ Mudeli arvutuses täideti puuduva ilma väärtusi ajutiselt kuni 3 varasema päeva keskmisega: " + ", ".join(sorted(d.strftime("%d.%m") for d in any_weather_imputation)) + ". Ilma ajaloo tabelis jäävad mõõdetud andmed muutmata.")
 
         for target_day, rows_day in forecast_days:
             vals = [r["Kokku"] for r in rows_day if r["Kokku"] is not None]
