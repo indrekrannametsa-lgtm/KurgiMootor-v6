@@ -703,7 +703,7 @@ with tabs[2]:
         return None, False
 
     measured_display = []
-    estimated_display_rows = set()
+    estimated_display_cells = set()
 
     for idx, r in enumerate(measured_rows):
         try:
@@ -713,6 +713,16 @@ with tabs[2]:
 
         effective = {}
         estimated_features = []
+        display_col_by_feature = {
+            "temp_min_c": "Min °C",
+            "temp_max_c": "Max °C",
+            "wind_avg_ms": "Tuul m/s",
+            "humidity_avg_pct": "Niiskus %",
+            "precipitation_mm": "Sademed mm",
+            "et0_mm": "ET0 mm",
+            "radiation_mj_m2": "Radiatsioon MJ/m²",
+        }
+
         for feature in weather_columns:
             if row_day is None:
                 effective[feature] = r.get(feature)
@@ -721,11 +731,12 @@ with tabs[2]:
             effective[feature] = value
             if estimated:
                 estimated_features.append(feature)
+                estimated_display_cells.add((idx, display_col_by_feature[feature]))
 
         if estimated_features:
-            status = "🟡 Hinnanguline"
-            estimated_display_rows.add(idx)
-            control = "Puuduvad väärtused: kuni 3 varasema päeva keskmine"
+            status = "🟡 Osaliselt hinnanguline"
+            estimated_names = [display_col_by_feature[f] for f in estimated_features]
+            control = "Hinnanguline: " + ", ".join(estimated_names)
         elif r.get("checked"):
             status = "🟢 Kontrollitud"
             control = r.get("check_message")
@@ -750,12 +761,30 @@ with tabs[2]:
     if not measured_df.empty:
         styled_weather = measured_df.style
 
-        if estimated_display_rows:
-            def _highlight_estimated(row):
-                if row.name in estimated_display_rows:
-                    return ["background-color: rgba(255, 193, 7, 0.25)" for _ in row]
-                return ["" for _ in row]
-            styled_weather = styled_weather.apply(_highlight_estimated, axis=1)
+        def _highlight_estimated_cells(data):
+            styles = pd.DataFrame("", index=data.index, columns=data.columns)
+            for row_idx, col_name in estimated_display_cells:
+                if row_idx in styles.index and col_name in styles.columns:
+                    styles.loc[row_idx, col_name] = "background-color: rgba(255, 193, 7, 0.30)"
+            # Olek jääb kollaseks, kui päevas on vähemalt üks hinnanguline lahter.
+            estimated_rows = {r for r, _ in estimated_display_cells}
+            for row_idx in estimated_rows:
+                if row_idx in styles.index and "Olek" in styles.columns:
+                    styles.loc[row_idx, "Olek"] = "background-color: rgba(255, 193, 7, 0.20)"
+            return styles
+
+        styled_weather = styled_weather.apply(_highlight_estimated_cells, axis=None)
+
+        # Ainult kuvamisvorming; arvutustes jäävad täpsed väärtused alles.
+        styled_weather = styled_weather.format({
+            "Min °C": "{:.1f}",
+            "Max °C": "{:.1f}",
+            "Tuul m/s": "{:.2f}",
+            "Niiskus %": "{:.0f}",
+            "Sademed mm": "{:.1f}",
+            "ET0 mm": "{:.2f}",
+            "Radiatsioon MJ/m²": "{:.2f}",
+        }, na_rep="—")
 
         st.dataframe(styled_weather, use_container_width=True, hide_index=True)
     else:
