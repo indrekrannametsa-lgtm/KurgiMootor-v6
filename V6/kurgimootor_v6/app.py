@@ -658,24 +658,108 @@ with tabs[2]:
         if r.get("data_kind") == "forecast"
     ]
 
-    st.caption(f"Kuvatakse {len(measured_rows)} mõõdetud päeva. Kõik salvestatud ilmaandmed jäävad mootorile kasutada sõltumata valitud vaatest.")
-    measured_display = [{
-        "Kuupäev": r["weather_date"],
-        "Min °C": r.get("temp_min_c"),
-        "Max °C": r.get("temp_max_c"),
-        "Tuul m/s": r.get("wind_avg_ms"),
-        "Niiskus %": r.get("humidity_avg_pct"),
-        "Sademed mm": r.get("precipitation_mm"),
-        "ET0 mm": r.get("et0_mm"),
-        "Radiatsioon MJ/m²": r.get("radiation_mj_m2"),
-        "Kontroll": r.get("check_message"),
-        "Olek": (
-            "🟢 Kontrollitud"
-            if r.get("checked")
-            else ("🟡 Ajutine prognoos" if str(r.get("check_message") or "").startswith("Ajutine") else "🔴 Puudulik")
-        ),
-    } for r in measured_rows]
-    st.dataframe(pd.DataFrame(measured_display), use_container_width=True, hide_index=True)
+    st.caption(
+        f"Kuvatakse {len(measured_rows)} päeva. 🟢 = täielikult mõõdetud; "
+        "🟡 = puuduv mõõdetud väärtus on tabelis ja mudelis ajutiselt täidetud kuni 3 varasema päeva keskmisega. "
+        "Andmebaasi mõõdetud rida selle tõttu ei muudeta."
+    )
+
+    weather_columns = [
+        "temp_min_c", "temp_max_c", "wind_avg_ms", "humidity_avg_pct",
+        "precipitation_mm", "et0_mm", "radiation_mj_m2",
+    ]
+
+    # Vajame fallbackiks ka kuni 3 päeva enne valitud ajaloo algust.
+    fallback_start = history_start - timedelta(days=3)
+    fallback_rows = db.get_weather_rows(fallback_start, history_end)
+    fallback_by_day = {
+        str(r.get("weather_date")): r
+        for r in fallback_rows
+        if r.get("data_kind") == "measured"
+    }
+
+    def _history_effective_value(day_value, feature):
+        """Tagastab (väärtus, kas_hinnanguline) ainult tabeli/mudeli töövaate jaoks."""
+        row = fallback_by_day.get(day_value.isoformat()) or {}
+        raw = row.get(feature)
+        try:
+            if raw is not None:
+                return float(raw), False
+        except (TypeError, ValueError):
+            pass
+
+        prior = []
+        for delta in range(1, 4):
+            prev = fallback_by_day.get((day_value - timedelta(days=delta)).isoformat()) or {}
+            val = prev.get(feature)
+            try:
+                if val is not None:
+                    prior.append(float(val))
+            except (TypeError, ValueError):
+                pass
+
+        if prior:
+            return float(np.mean(prior)), True
+        return None, False
+
+    measured_display = []
+    estimated_display_rows = set()
+
+    for idx, r in enumerate(measured_rows):
+        try:
+            row_day = date.fromisoformat(str(r.get("weather_date")))
+        except ValueError:
+            row_day = None
+
+        effective = {}
+        estimated_features = []
+        for feature in weather_columns:
+            if row_day is None:
+                effective[feature] = r.get(feature)
+                continue
+            value, estimated = _history_effective_value(row_day, feature)
+            effective[feature] = value
+            if estimated:
+                estimated_features.append(feature)
+
+        if estimated_features:
+            status = "🟡 Hinnanguline"
+            estimated_display_rows.add(idx)
+            control = "Puuduvad väärtused: kuni 3 varasema päeva keskmine"
+        elif r.get("checked"):
+            status = "🟢 Kontrollitud"
+            control = r.get("check_message")
+        else:
+            status = "🔴 Puudulik"
+            control = r.get("check_message")
+
+        measured_display.append({
+            "Kuupäev": r["weather_date"],
+            "Min °C": effective.get("temp_min_c"),
+            "Max °C": effective.get("temp_max_c"),
+            "Tuul m/s": effective.get("wind_avg_ms"),
+            "Niiskus %": effective.get("humidity_avg_pct"),
+            "Sademed mm": effective.get("precipitation_mm"),
+            "ET0 mm": effective.get("et0_mm"),
+            "Radiatsioon MJ/m²": effective.get("radiation_mj_m2"),
+            "Kontroll": control,
+            "Olek": status,
+        })
+
+    measured_df = pd.DataFrame(measured_display)
+    if not measured_df.empty:
+        styled_weather = measured_df.style
+
+        if estimated_display_rows:
+            def _highlight_estimated(row):
+                if row.name in estimated_display_rows:
+                    return ["background-color: rgba(255, 193, 7, 0.25)" for _ in row]
+                return ["" for _ in row]
+            styled_weather = styled_weather.apply(_highlight_estimated, axis=1)
+
+        st.dataframe(styled_weather, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(measured_df, use_container_width=True, hide_index=True)
 
     st.subheader("9 päeva prognoos")
     forecast_display = [{
