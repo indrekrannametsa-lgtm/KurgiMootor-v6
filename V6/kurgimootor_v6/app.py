@@ -324,9 +324,15 @@ with tabs[0]:
     harvest_history_for_plan = db.get_harvest_history()
     today_planned_fields = _planned_fields_for_day(TODAY, today_rows, harvest_history_for_plan)
 
+    # Päeva vahetudes lähtestame tänase plaani automaatselt.
     current_home_day = TODAY.isoformat()
     if st.session_state.get("home_plan_day") != current_home_day:
         st.session_state["home_plan_day"] = current_home_day
+        st.session_state["home_today_fields"] = list(today_planned_fields)
+
+    # Turvavõrk: kui sessionis on tühi/puuduv valik ilma kasutaja teadliku muutmiseta,
+    # alustame tänase automaatse plaaniga.
+    if "home_today_fields" not in st.session_state:
         st.session_state["home_today_fields"] = list(today_planned_fields)
 
     selected_today_fields = st.multiselect(
@@ -2159,6 +2165,8 @@ with tabs[3]:
         today_rows_live = db.get_harvest_for_day(TODAY)
         today_plan_default = _planned_fields_for_day(TODAY, today_rows_live, harvest_rows)
 
+        # Avalehel võib kasutaja tänase 3 põllu valikust ühe eemaldada.
+        # Kui sessionis pole valikut, kasutame automaatset plaani.
         selected_home = st.session_state.get("home_today_fields")
         if selected_home is not None:
             today_plan = [int(f) for f in list(selected_home)[:4]]
