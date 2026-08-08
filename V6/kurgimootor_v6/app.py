@@ -477,10 +477,29 @@ with tabs[1]:
             key=f"manual_harvest_order_{form_version}",
         )
         q1, q2, q3, q4 = st.columns(4)
-        entry_a = q1.number_input("A", 0.0, step=0.1, format="%.1f", key=f"manual_a_{form_version}")
-        entry_b = q2.number_input("B", 0.0, step=0.1, format="%.1f", key=f"manual_b_{form_version}")
-        entry_c = q3.number_input("C", 0.0, step=0.1, format="%.1f", key=f"manual_c_{form_version}")
-        entry_xl = q4.number_input("XL", 0.0, step=0.1, format="%.1f", key=f"manual_xl_{form_version}")
+        entry_a_raw = q1.number_input(
+            "A", min_value=0.0, value=None, step=0.1, format="%.1f",
+            placeholder="0,0", key=f"manual_a_{form_version}"
+        )
+        entry_b_raw = q2.number_input(
+            "B", min_value=0.0, value=None, step=0.1, format="%.1f",
+            placeholder="0,0", key=f"manual_b_{form_version}"
+        )
+        entry_c_raw = q3.number_input(
+            "C", min_value=0.0, value=None, step=0.1, format="%.1f",
+            placeholder="0,0", key=f"manual_c_{form_version}"
+        )
+        entry_xl_raw = q4.number_input(
+            "XL", min_value=0.0, value=None, step=0.1, format="%.1f",
+            placeholder="0,0", key=f"manual_xl_{form_version}"
+        )
+
+        # Tühi väli tähendab 0, kuid kasutaja ei pea telefonis nulli kustutama.
+        entry_a = float(entry_a_raw or 0.0)
+        entry_b = float(entry_b_raw or 0.0)
+        entry_c = float(entry_c_raw or 0.0)
+        entry_xl = float(entry_xl_raw or 0.0)
+
         total_preview = entry_a + entry_b + entry_c + entry_xl
         cb_preview = entry_c / entry_b if entry_b > 0 else None
         preview_text = f"Kokku: {_fmt(total_preview)}"
