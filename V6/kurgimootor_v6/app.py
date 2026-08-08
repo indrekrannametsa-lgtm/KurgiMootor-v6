@@ -2426,6 +2426,29 @@ with tabs[3]:
         # uue korje järel päeva jooksul muutub. Võitja nimi salvestub basis-väljale.
         MODEL_VERSION = "v6.4-growth-nonlinear-temp-nights-wind-daylength-v5"
         forecast_payloads = []
+
+        # Salvesta ka tänase päeva prognoos lead=0 snapshotina.
+        # See võimaldab hiljem näha, kuhu 5p/3p/1p/täna prognoos korjepäeva lähenedes liikus.
+        # Tänase päeva snapshot lukustatakse enne esimese tegeliku korje sisestamist.
+        if not today_rows_live:
+            for row in today_forecast_rows:
+                if row.get("A+B+C") is None or row.get("XL") is None or row.get("Kokku") is None:
+                    continue
+                forecast_payloads.append({
+                    "forecast_date": TODAY.isoformat(),
+                    "target_date": TODAY.isoformat(),
+                    "field_no": int(row["Põld"]),
+                    "lead_days": 0,
+                    "abc_forecast": float(row["A+B+C"]),
+                    "cb_forecast": float(row["C/B"]) if row.get("C/B") is not None else None,
+                    "xl_forecast": float(row["XL"]),
+                    "total_forecast": float(row["Kokku"]),
+                    "interval_days": row.get("Intervall"),
+                    "basis": f"tänane tööprognoos; champion={champion_name}; cb_champion={cb_champion_name}",
+                    "estimated_weather_days": row.get("Hinnanguline ilm") or "",
+                    "model_version": MODEL_VERSION,
+                })
+
         for target_day, rows_day in forecast_days:
             for row in rows_day:
                 if row.get("A+B+C") is None or row.get("XL") is None or row.get("Kokku") is None:
@@ -2455,6 +2478,67 @@ with tabs[3]:
         except db.DatabaseError as exc:
             st.warning(f"Prognoosid arvutatakse, kuid ajaloo salvestamine ebaõnnestus: {exc}")
 
+        # Prognoosi liikumine: esimene sama korjepäeva snapshot vs praegune prognoos.
+        # Kasutame ainult sama põllukomplekti täielikke snapshot'e.
+        forecast_history_rows = []
+        try:
+            if db.yield_forecasts_available():
+                forecast_history_rows = db.get_yield_forecasts(limit=5000)
+        except db.DatabaseError:
+            forecast_history_rows = []
+
+        def _forecast_adjustment(target_day_value, field_numbers, current_total):
+            expected = {int(f) for f in field_numbers}
+            if not expected or current_total is None:
+                return None, None, None
+
+            # Kui sama forecast_date/field kohta on mitu model_version rida,
+            # eelista kõige hiljem genereeritut.
+            picked = {}
+            for hist in forecast_history_rows:
+                if str(hist.get("target_date")) != target_day_value.isoformat():
+                    continue
+                try:
+                    fno = int(hist.get("field_no"))
+                except (TypeError, ValueError):
+                    continue
+                if fno not in expected:
+                    continue
+                fdate = str(hist.get("forecast_date") or "")
+                key = (fdate, fno)
+                old_hist = picked.get(key)
+                if old_hist is None or str(hist.get("generated_at") or "") > str(old_hist.get("generated_at") or ""):
+                    picked[key] = hist
+
+            by_date = {}
+            for (fdate, fno), hist in picked.items():
+                by_date.setdefault(fdate, {})[fno] = hist
+
+            complete = []
+            for fdate, rows_for_date in by_date.items():
+                if set(rows_for_date.keys()) != expected:
+                    continue
+                try:
+                    total = sum(float(rows_for_date[f]["total_forecast"]) for f in expected)
+                except (TypeError, ValueError, KeyError):
+                    continue
+                complete.append((fdate, total))
+
+            if not complete:
+                return None, None, None
+
+            complete.sort(key=lambda x: x[0])
+            earlier = [(fdate, total) for fdate, total in complete if fdate < TODAY.isoformat()]
+            if not earlier:
+                return None, None, None
+
+            first_date, first_total = earlier[0]
+            if first_total <= 0:
+                return None, first_total, first_date
+
+            pct = (float(current_total) / first_total - 1.0) * 100.0
+            return pct, first_total, first_date
+
         # --- Avalehe kiire ülevaade ---
         try:
             selected_set = {int(f) for f in today_plan}
@@ -2466,6 +2550,50 @@ with tabs[3]:
                 "total": 0.0, "a": 0.0, "b": 0.0, "c": 0.0, "xl": 0.0, "cb": None
             }
             actual_cb_text = "—" if actual_sum["cb"] is None else _fmt(actual_sum["cb"], 2)
+            actual_complete = bool(today_plan) and len(actual_rows_home) == len(today_plan)
+            actual_error_text = ""
+
+            saved_today_candidates = {}
+            expected_today_fields = {int(f) for f in today_plan}
+            for hist in forecast_history_rows:
+                if str(hist.get("target_date")) != TODAY.isoformat():
+                    continue
+                fdate = str(hist.get("forecast_date") or "")
+                if not fdate or fdate >= TODAY.isoformat():
+                    continue
+                try:
+                    fno = int(hist.get("field_no"))
+                except (TypeError, ValueError):
+                    continue
+                if fno not in expected_today_fields:
+                    continue
+                key = (fdate, fno)
+                prev_hist = saved_today_candidates.get(key)
+                if prev_hist is None or str(hist.get("generated_at") or "") > str(prev_hist.get("generated_at") or ""):
+                    saved_today_candidates[key] = hist
+
+            today_by_date = {}
+            for (fdate, fno), hist in saved_today_candidates.items():
+                today_by_date.setdefault(fdate, {})[fno] = hist
+
+            saved_today_total = None
+            complete_dates = []
+            for fdate, rows_for_date in today_by_date.items():
+                if set(rows_for_date.keys()) != expected_today_fields:
+                    continue
+                try:
+                    total = sum(float(rows_for_date[f]["total_forecast"]) for f in expected_today_fields)
+                except (TypeError, ValueError, KeyError):
+                    continue
+                complete_dates.append((fdate, total))
+            if complete_dates:
+                complete_dates.sort(key=lambda x: x[0])
+                saved_today_total = complete_dates[-1][1]
+
+            if actual_complete and actual_sum["total"] > 0 and saved_today_total is not None:
+                forecast_error_pct = (saved_today_total / float(actual_sum["total"]) - 1.0) * 100.0
+                actual_error_text = f" · prognoosiviga {forecast_error_pct:+.0f}%"
+
             with home_today_actual_slot.container():
                 st.markdown(
                     f"""
@@ -2473,7 +2601,7 @@ with tabs[3]:
                       <div style="font-size:.80rem;font-weight:900;letter-spacing:.10em;opacity:.58;">TEGELIK</div>
                       <div style="font-size:2.15rem;font-weight:900;line-height:1.05;margin-top:3px;">{_fmt(actual_sum['total'])} kasti</div>
                       <div style="font-size:.92rem;opacity:.74;margin-top:6px;">
-                        A {_fmt(actual_sum['a'])} · B {_fmt(actual_sum['b'])} · C {_fmt(actual_sum['c'])} · XL {_fmt(actual_sum['xl'])} · C/B {actual_cb_text}
+                        A {_fmt(actual_sum['a'])} · B {_fmt(actual_sum['b'])} · C {_fmt(actual_sum['c'])} · XL {_fmt(actual_sum['xl'])} · C/B {actual_cb_text}{actual_error_text}
                       </div>
                     </div>
                     """,
@@ -2488,13 +2616,25 @@ with tabs[3]:
                 today_cb_vals = [float(r["C/B"]) for r in today_vals if r.get("C/B") is not None]
                 today_cb_fc = float(np.mean(today_cb_vals)) if today_cb_vals else None
                 cb_fc_text = "—" if today_cb_fc is None else _fmt(today_cb_fc, 2)
+                today_adjust_pct, today_first_fc, today_first_date = _forecast_adjustment(
+                    TODAY,
+                    [r["Põld"] for r in today_vals],
+                    today_total_fc,
+                )
+                if today_adjust_pct is None:
+                    today_adjust_text = "kohendus —"
+                else:
+                    today_adjust_text = f"kohendus {today_adjust_pct:+.0f}%"
 
                 with home_today_forecast_slot.container():
                     st.markdown(
                         f"""
                         <div style="border:2px solid rgba(76,160,92,.38);border-radius:12px;padding:12px 14px;">
                           <div style="font-size:.80rem;font-weight:900;letter-spacing:.10em;opacity:.58;">PROGNOOS</div>
-                          <div style="font-size:2.15rem;font-weight:950;line-height:1.05;margin-top:3px;">{_fmt(today_total_fc)} kasti</div>
+                          <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;margin-top:3px;">
+                            <div style="font-size:2.15rem;font-weight:950;line-height:1.05;">{_fmt(today_total_fc)} kasti</div>
+                            <div style="font-size:1.02rem;font-weight:800;opacity:.76;">{today_adjust_text}</div>
+                          </div>
                           <div style="font-size:.92rem;opacity:.76;margin-top:6px;">
                             A+B+C {_fmt(today_abc_fc)} · XL {_fmt(today_xl_fc)} · C/B ~{cb_fc_text}
                           </div>
@@ -2529,6 +2669,11 @@ with tabs[3]:
                     cb_day = float(np.mean(cb_vals)) if cb_vals else None
                     cb_text = "—" if cb_day is None else _fmt(cb_day, 2)
                     lead = (target_day - TODAY).days
+                    field_numbers_day = [int(r["Põld"]) for r in valid]
+                    adj_pct, first_fc_total, first_fc_date = _forecast_adjustment(
+                        target_day, field_numbers_day, total_day
+                    )
+                    adj_text = "kohendus —" if adj_pct is None else f"kohendus {adj_pct:+.0f}%"
                     trend = lead >= 6
                     bg = "#fff3cd" if trend else "rgba(0,0,0,0.025)"
                     border = "#ffe69c" if trend else "rgba(128,128,128,0.20)"
@@ -2542,7 +2687,7 @@ with tabs[3]:
                               <span style="font-size:1.65rem;font-weight:950;opacity:.38;">{_weekday_letter(target_day)}</span>
                               <strong style="font-size:1.05rem;">{_short_date(target_day)}</strong>
                             </div>
-                            <strong style="font-size:1.15rem;">{_fmt(total_day)} kasti{badge}</strong>
+                            <strong style="font-size:1.15rem;">{_fmt(total_day)} kasti · {adj_text}{badge}</strong>
                           </div>
                           <div style="font-size:0.90rem;opacity:0.78;margin-top:3px;">
                             A+B+C {_fmt(abc_day)} · XL {_fmt(xl_day)} · C/B ~{cb_text}
