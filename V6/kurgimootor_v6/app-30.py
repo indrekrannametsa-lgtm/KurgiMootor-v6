@@ -3035,4 +3035,124 @@ with tabs[3]:
 
 with tabs[4]:
     st.subheader("Mootori tähelepanekud")
-    st.info("Mootor hakkab hiljem mustreid kuvama, kuid ei muuda mudelit ise.")
+    st.caption(
+        "See leht tõlgendab mootori juba tehtud walk-forward teste. "
+        "Tähelepanekud ei muuda mudelit ega lisa tunnuseid automaatselt."
+    )
+
+    _obs_ready = bool(training_rows) and "trace_df" in locals() and "champion_name" in locals()
+
+    if not _obs_ready:
+        st.info("Mootoril pole veel piisavalt ausaid walk-forward teste, et tähelepanekuid teha.")
+    else:
+        st.markdown("### ✅ Praegu usaldan")
+
+        if champion_stats:
+            st.success(
+                f"**A+B+C champion: {champion_name}.** "
+                f"Walk-forward testis on MAE {champion_stats['Katse MAE']:.2f} kasti/põld, "
+                f"baasmudelil {champion_stats['Baas MAE']:.2f}. "
+                f"Kandidaat võitis {champion_stats['Võidab ridu %']:.0f}% samadest testiridadest."
+            )
+        else:
+            st.success(
+                f"**A+B+C champion: {champion_name}.** "
+                f"Weather-first baas püsib parim; selle walk-forward MAE on {champion_mae:.2f} kasti/põld. "
+                "Ükski lubatud lisajälg pole veel tõestanud piisavalt stabiilset eelist."
+            )
+
+        if "cb_champion_name" in locals():
+            if cb_champion_stats:
+                st.success(
+                    f"**C/B champion: {cb_champion_name}.** "
+                    f"Walk-forward MAE {cb_champion_mae:.2f}; "
+                    f"paranemine võrreldes baasiga {cb_champion_stats['Paranemine']:.2f}."
+                )
+            else:
+                st.info(
+                    f"**C/B: {cb_champion_name}.** "
+                    "Ükski lisajälg ei ole veel läbinud C/B stabiilsusreeglit."
+                )
+
+        _operational_trace = trace_df[
+            trace_df["Jälg"].isin(operational_candidate_groups.keys())
+        ].copy()
+        _operational_trace = _operational_trace.sort_values("Paranemine", ascending=False)
+
+        _watch = _operational_trace[
+            (_operational_trace["Paranemine"] > 0)
+            & (~_operational_trace["Stabiilne"])
+        ].head(4)
+
+        st.markdown("### 👀 Hoian silma peal")
+
+        if _watch.empty:
+            st.caption(
+                "Praegu pole ühtegi lubatud lisajälge, mis parandaks baasi, "
+                "kuid jääks napilt stabiilsuslävendi alla."
+            )
+        else:
+            for _, _r in _watch.iterrows():
+                _name = str(_r["Jälg"])
+
+                _role = (
+                    "ilmastikujälg"
+                    if _name in weather_candidate_groups
+                    else "bioloogilise koormuse jälg"
+                    if _name in biological_load_candidate_groups
+                    else "lisajälg"
+                )
+
+                st.write(
+                    f"• **{_name}** ({_role}) — "
+                    f"MAE muutus {_r['Paranemine']:+.2f} kasti, "
+                    f"võitis {_r['Võidab ridu %']:.0f}% testiridadest, "
+                    "kuid ei ole veel piisavalt stabiilne."
+                )
+
+        _rejected = _operational_trace[
+            _operational_trace["Paranemine"] <= 0
+        ].head(5)
+
+        st.markdown("### ⛔ Praegu ei kasuta")
+
+        if _rejected.empty:
+            st.caption(
+                "Praegu pole lubatud kandidaate, "
+                "mis oleksid walk-forward testis baasist selgelt halvemad."
+            )
+        else:
+            for _, _r in _rejected.iterrows():
+                st.write(
+                    f"• **{_r['Jälg']}** — ei parandanud baasmudelit "
+                    f"(MAE muutus {_r['Paranemine']:+.2f} kasti)."
+                )
+
+        if "memory_diagnostic_groups" in locals():
+            _memory_trace = trace_df[
+                trace_df["Jälg"].isin(memory_diagnostic_groups.keys())
+            ].copy()
+
+            _memory_trace = _memory_trace.sort_values(
+                "Paranemine",
+                ascending=False
+            )
+
+            if not _memory_trace.empty:
+                _best_memory = _memory_trace.iloc[0]
+
+                st.divider()
+                st.markdown("#### 🧪 Ainult uurimiseks")
+                st.write(
+                    f"Tugevaim saagimälu diagnostiline signaal on praegu "
+                    f"**{_best_memory['Jälg']}** "
+                    f"(MAE muutus {_best_memory['Paranemine']:+.2f} kasti; "
+                    f"võitis {_best_memory['Võidab ridu %']:.0f}% ridadest). "
+                    "Seda ei kasutata A+B+C operatiivse prognoosi ankruna."
+                )
+
+        st.caption(
+            "Tähelepanekud arvutatakse uuesti iga uue korje järel "
+            "samadest walk-forward tulemustest. "
+            "Leht ise ei õpeta ega muuda mootorit."
+        )
