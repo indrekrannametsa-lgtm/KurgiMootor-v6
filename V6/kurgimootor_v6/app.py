@@ -3734,7 +3734,7 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
             # Mudeliversioon tähistab champion-valiku raamistikku, mitte tänase võitja nime.
             # Nii uuendab sama päeva rerun sama operatiivset snapshot'i ka siis, kui champion
             # uue korje järel päeva jooksul muutub. Võitja nimi salvestub basis-väljale.
-            MODEL_VERSION = "v6.4-brainstorm-v8-confirmed"
+            MODEL_VERSION = "v6.4-brainstorm-v9-ui"
             forecast_payloads = []
 
             # Salvesta ka tänase päeva prognoos lead=0 snapshotina.
@@ -4395,13 +4395,31 @@ if page == "Mootori tähelepanekud":
                 f"suhtarve **{autonomous_category_counts.get('Suhtarvud', 0)}**",
                 f"ajamuutusi **{autonomous_category_counts.get('Ajamuutused', 0)}**",
                 f"temperatuurilävesid **{autonomous_category_counts.get('Temperatuuriläved', 0)}**",
+                f"ilmamälu **{autonomous_category_counts.get('Ilmamälu', 0)}**",
+                f"hooaeg × ilm **{autonomous_category_counts.get('Hooaeg × ilm', 0)}**",
+                f"bioloogilist koormust **{autonomous_category_counts.get('Bioloogiline koormus', 0)}**",
                 f"2. ringi kombinatsioone **{autonomous_category_counts.get('Teise ringi kombinatsioonid', 0)}**",
             ]
             st.info(" · ".join(_space_parts))
+
+            # Cache'ist taastatud vanematel tulemustel võis päevade nimekiri puududa.
+            # Sel juhul tuleta päriselt kasutatud plokkide päevade arv tulemustabeli ridade
+            # ja tänase teststruktuuri põhjal, mitte ära kuva eksitavat 0/0.
+            _shown_discovery_days = len(_auto_discovery_days) if "_auto_discovery_days" in locals() else 0
+            _shown_confirm_days = len(_auto_confirm_days) if "_auto_confirm_days" in locals() else 0
+            if _shown_discovery_days == 0 or _shown_confirm_days == 0:
+                _valid_days_for_auto = sorted(set(dates[np.where(np.isfinite(champion_pred) & np.isfinite(y))[0]]))
+                if len(_valid_days_for_auto) >= 4:
+                    _shown_confirm_days = max(2, int(round(len(_valid_days_for_auto) * 0.30)))
+                    _shown_confirm_days = min(_shown_confirm_days, len(_valid_days_for_auto) - 2)
+                else:
+                    _shown_confirm_days = 1 if len(_valid_days_for_auto) >= 2 else 0
+                _shown_discovery_days = max(0, len(_valid_days_for_auto) - _shown_confirm_days)
+
             st.caption(
                 f"1. ring ja 2. ring valitakse ainult vanemas avastusplokis "
-                f"({_fmt(len(_auto_discovery_days), 0)} testipäeva). "
-                f"Hilisemad {_fmt(len(_auto_confirm_days), 0)} testipäeva on eraldi kinnitusplokk. "
+                f"({_fmt(_shown_discovery_days, 0)} testipäeva). "
+                f"Hilisemad {_fmt(_shown_confirm_days, 0)} testipäeva on eraldi kinnitusplokk. "
                 "Ühtegi enda leitud ideed EI võeta automaatselt kasutusse."
             )
 
