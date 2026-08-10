@@ -264,6 +264,79 @@ def get_app_setting(key: str, default: str = "") -> str:
     return str(rows[0]["value"]) if rows else default
 
 
+def save_harvest_plan(day: date, field_nos: List[int]) -> None:
+    """Säilitab konkreetse päeva kasutaja valitud korjepõllud.
+
+    Tühi loend tähendab teadlikult, et sellel päeval korjet ei planeerita.
+    """
+    clean: List[int] = []
+    for value in field_nos:
+        try:
+            field_no = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= field_no <= 14 and field_no not in clean:
+            clean.append(field_no)
+    set_app_setting(
+        f"harvest_plan_{day.isoformat()}",
+        json.dumps(clean, ensure_ascii=False),
+    )
+
+
+def get_harvest_plan(day: date) -> List[int] | None:
+    """Tagastab päeva salvestatud tööplaani; None = vanal päeval plaani ei salvestatud."""
+    raw = get_app_setting(f"harvest_plan_{day.isoformat()}", "")
+    if raw == "":
+        return None
+    try:
+        values = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(values, list):
+        return None
+    clean: List[int] = []
+    for value in values:
+        try:
+            field_no = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= field_no <= 14 and field_no not in clean:
+            clean.append(field_no)
+    return clean
+
+
+def get_harvest_plans() -> Dict[str, List[int]]:
+    """Loeb kõik salvestatud päevaplaanid ühe päringuga mudeli valmisoleku kontrolliks."""
+    response = _execute(
+        _client().table("app_settings")
+        .select("key,value")
+        .like("key", "harvest_plan_%")
+    )
+    result: Dict[str, List[int]] = {}
+    for row in list(response.data or []):
+        key = str(row.get("key") or "")
+        if not key.startswith("harvest_plan_"):
+            continue
+        day_key = key.removeprefix("harvest_plan_")
+        try:
+            date.fromisoformat(day_key)
+            values = json.loads(str(row.get("value") or "[]"))
+        except Exception:
+            continue
+        if not isinstance(values, list):
+            continue
+        clean: List[int] = []
+        for value in values:
+            try:
+                field_no = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= field_no <= 14 and field_no not in clean:
+                clean.append(field_no)
+        result[day_key] = clean
+    return result
+
+
 def save_weather_forecast_snapshot(day: date, payload: Dict[str, Any]) -> None:
     """Säilitab päeva forecast'i eraldi, et minevikku jõudes ei kaoks see measured upsert'iga."""
     key = f"weather_forecast_snapshot_{day.isoformat()}"

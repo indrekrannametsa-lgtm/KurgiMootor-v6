@@ -15,6 +15,20 @@ import streamlit.components.v1 as components
 
 import db
 from core import WeatherService
+from model_engine import (
+    temperature_curve_features as _temperature_curve_features,
+    daylength_hours as _daylength_hours,
+    daylength_change_7d as _daylength_change_7d,
+    season_curve_features as _season_curve_features,
+    chronological_discovery_confirmation_days as _engine_discovery_confirmation_days,
+    build_ridge_design as _engine_build_ridge_design,
+    ridge_walk_predict as _engine_ridge_walk_predict,
+    abc_growth_walk_predict as _engine_abc_growth_walk_predict,
+    fit_full_generic as _engine_fit_full_generic,
+    predict_full_generic as _engine_predict_full_generic,
+    fit_full_abc_growth as _engine_fit_full_abc_growth,
+    predict_full_abc_growth as _engine_predict_full_abc_growth,
+)
 
 TODAY = datetime.now(ZoneInfo("Europe/Tallinn")).date()
 SEASON_START = date(TODAY.year, 6, 15)
@@ -223,69 +237,6 @@ def _mark_model_dirty(reason: str) -> None:
 def _model_is_dirty() -> bool:
     return db.get_app_setting("model_dirty", "1") == "1"
 
-
-def _temperature_curve_features(night_avgs, day_avgs):
-    """Literature-informed, data-fitted nonlinear cucumber temperature basis.
-
-    Breakpoints encode only where physiology plausibly changes regime.
-    The coefficients/strength are learned from this farm's harvest data.
-
-    Night:
-      <16 C  : cold deficit + squared cold deficit (curvature; 12 can hurt far more than 14)
-      16-20 C: warm-night band
-      >20 C  : hot-night excess
-
-    Day:
-      <20 C  : cool-day deficit + squared deficit
-      20-28 C: productive warm band
-      >30 C  : heat excess + squared heat excess
-
-    Values are interval means so harvest interval length remains a separate feature.
-    """
-    night_avgs = np.asarray(list(night_avgs), dtype=float)
-    day_avgs = np.asarray(list(day_avgs), dtype=float)
-    if len(night_avgs) == 0 or len(day_avgs) == 0:
-        return {}
-
-    night_cold = np.maximum(0.0, 16.0 - night_avgs)
-    night_warm = np.clip(night_avgs - 16.0, 0.0, 4.0)
-    night_hot = np.maximum(0.0, night_avgs - 20.0)
-
-    day_cool = np.maximum(0.0, 20.0 - day_avgs)
-    day_warm = np.clip(day_avgs - 20.0, 0.0, 8.0)
-    day_hot = np.maximum(0.0, day_avgs - 30.0)
-
-    return {
-        "Öö jahedus <16": float(np.mean(night_cold)),
-        "Öö jahedus² <16": float(np.mean(night_cold ** 2)),
-        "Öö soojus 16-20": float(np.mean(night_warm)),
-        "Öö kuumus >20": float(np.mean(night_hot)),
-        "Päeva jahedus <20": float(np.mean(day_cool)),
-        "Päeva jahedus² <20": float(np.mean(day_cool ** 2)),
-        "Päeva soojus 20-28": float(np.mean(day_warm)),
-        "Päeva kuumus >30": float(np.mean(day_hot)),
-        "Päeva kuumus² >30": float(np.mean(day_hot ** 2)),
-    }
-
-
-
-
-# Astronoomiline päevapikkus Pärnu piirkonna laiuskraadil.
-# Longitude pole päevapikkuse kestuse jaoks vajalik; kasutame geograafilist laiust ~58.38 N.
-DAYLENGTH_LAT = 58.38
-
-def _daylength_hours(day_value):
-    n = int(day_value.timetuple().tm_yday)
-    lat = math.radians(DAYLENGTH_LAT)
-    # NOAA-tüüpi lihtsustatud päikesedeklinatsioon; piisav fotoperioodi tunnuseks.
-    decl = math.radians(23.44) * math.sin(2.0 * math.pi * (284 + n) / 365.0)
-    cos_omega = -math.tan(lat) * math.tan(decl)
-    cos_omega = max(-1.0, min(1.0, cos_omega))
-    omega = math.acos(cos_omega)
-    return 24.0 * omega / math.pi
-
-def _daylength_change_7d(day_value):
-    return _daylength_hours(day_value) - _daylength_hours(day_value - timedelta(days=7))
 
 def _format_field_value(value, digits=1):
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -546,16 +497,20 @@ if page == "Täna":
     harvest_history_for_plan = db.get_harvest_history()
     today_planned_fields = _planned_fields_for_day(TODAY, today_rows, harvest_history_for_plan)
 
-    # Päeva vahetudes lähtestame tänase plaani automaatselt.
+    # Päeva tööplaan säilitatakse andmebaasis. Nii tähendab "täielik korjepäev"
+    # päriselt seda, et kõik selleks päevaks valitud põllud on sisestatud — mitte 3/3.
+    saved_today_plan = db.get_harvest_plan(TODAY)
+    initial_today_plan = list(saved_today_plan) if saved_today_plan is not None else list(today_planned_fields)
+
+    # Päeva vahetudes taastame salvestatud plaani; vanal/veel salvestamata päeval
+    # kasutame senist automaatset põlluplaani.
     current_home_day = TODAY.isoformat()
     if st.session_state.get("home_plan_day") != current_home_day:
         st.session_state["home_plan_day"] = current_home_day
-        st.session_state["home_today_fields"] = list(today_planned_fields)
+        st.session_state["home_today_fields"] = list(initial_today_plan)
 
-    # Turvavõrk: kui sessionis on tühi/puuduv valik ilma kasutaja teadliku muutmiseta,
-    # alustame tänase automaatse plaaniga.
     if "home_today_fields" not in st.session_state:
-        st.session_state["home_today_fields"] = list(today_planned_fields)
+        st.session_state["home_today_fields"] = list(initial_today_plan)
 
     selected_today_fields = st.multiselect(
         "Täna korjatavad põllud",
@@ -564,6 +519,10 @@ if page == "Täna":
         max_selections=4,
         help="Muuda ainult tänase tööplaani. Saagi sisestamine käib Korjed-menüüs.",
     )
+
+    selected_today_fields = [int(f) for f in selected_today_fields]
+    if saved_today_plan != selected_today_fields:
+        db.save_harvest_plan(TODAY, selected_today_fields)
 
     if selected_today_fields:
         if len(selected_today_fields) >= 2:
@@ -933,21 +892,30 @@ elif page == "Korjed":
     # pärast salvestust esmaseks, et järgmisele reale liikumine oleks kohene.
     today_rows_for_form = db.get_harvest_for_day(TODAY)
     history_for_form = db.get_harvest_history()
-    planned_for_form = _planned_fields_for_day(TODAY, today_rows_for_form, history_for_form)
+    auto_planned_for_form = _planned_fields_for_day(TODAY, today_rows_for_form, history_for_form)
+    saved_plan_for_form = db.get_harvest_plan(TODAY)
+    planned_for_form = (
+        list(saved_plan_for_form)
+        if saved_plan_for_form is not None and saved_plan_for_form
+        else list(auto_planned_for_form)
+    )
+    expected_order_count = len(saved_plan_for_form) if saved_plan_for_form else 3
+    expected_orders = tuple(range(1, max(1, expected_order_count) + 1))
 
     used_orders = {
         int(r.get("harvest_order"))
         for r in today_rows_for_form
-        if r.get("harvest_order") is not None and int(r.get("harvest_order")) in (1, 2, 3)
+        if r.get("harvest_order") is not None and int(r.get("harvest_order")) in expected_orders
     }
-    missing_orders = [order for order in (1, 2, 3) if order not in used_orders]
+    missing_orders = [order for order in expected_orders if order not in used_orders]
 
     if missing_orders:
         inferred_order = missing_orders[0]
-        inferred_field = int(planned_for_form[inferred_order - 1])
+        plan_index = inferred_order - 1
+        inferred_field = int(planned_for_form[plan_index]) if plan_index < len(planned_for_form) else int(planned_for_form[0])
     elif today_rows_for_form:
-        # Päev on 3/3 valmis. Kui kasutaja siiski lisab/parandab uut rida,
-        # alustame järgmisest põllust ja järjekorrast 1.
+        # Kõik tänaseks valitud põllud on sisestatud. Kui kasutaja siiski lisab/parandab
+        # uut rida, alustame järgmisest põllust ja järjekorrast 1.
         ordered_complete = sorted(today_rows_for_form, key=lambda r: int(r.get("harvest_order") or 99))
         inferred_field = _next_field(int(ordered_complete[-1].get("field_no")))
         inferred_order = 1
@@ -991,8 +959,8 @@ elif page == "Korjed":
     )
     entry_order = c3.selectbox(
         "Järjekord",
-        [1, 2, 3],
-        index=max(0, min(2, existing_order - 1)),
+        [1, 2, 3, 4],
+        index=max(0, min(3, existing_order - 1)),
         key=f"manual_harvest_order_{form_version}",
     )
 
@@ -1081,19 +1049,27 @@ elif page == "Korjed":
                     harvest_order=entry_order,
                 )
 
-                # Esimene ja teine korje ainult salvestuvad. Raske mudeliring muutub
-                # vajalikuks alles siis, kui päev on terviklik 3/3.
+                # Raske mudeliring muutub vajalikuks alles siis, kui kõik selleks päevaks
+                # valitud korjepõllud on sisestatud. Vanade päevade puhul, mille plaani
+                # veel ei salvestatud, säilitame tagasiühilduvuseks senise 3-põllu reegli.
                 _saved_day_rows = db.get_harvest_for_day(entry_date)
                 _saved_day_fields = {
                     int(r.get("field_no"))
                     for r in _saved_day_rows
                     if r.get("field_no") is not None
                 }
-                if len(_saved_day_rows) == 3 and len(_saved_day_fields) == 3:
-                    _mark_model_dirty(f"täielik 3/3 korjepäev {entry_date}")
+                _saved_plan = db.get_harvest_plan(entry_date)
+                if _saved_plan is not None:
+                    _expected_fields = set(int(f) for f in _saved_plan)
+                    _day_complete = bool(_expected_fields) and _saved_day_fields == _expected_fields
+                else:
+                    _day_complete = len(_saved_day_rows) == 3 and len(_saved_day_fields) == 3
+                if _day_complete:
+                    _mark_model_dirty(f"täielik korjepäev {entry_date}")
 
                 st.session_state["next_harvest_field"] = 1 if entry_field >= 14 else entry_field + 1
-                st.session_state["next_harvest_order"] = 1 if entry_order >= 3 else entry_order + 1
+                _order_limit = len(_saved_plan) if _saved_plan else 3
+                st.session_state["next_harvest_order"] = 1 if entry_order >= _order_limit else entry_order + 1
                 st.session_state["harvest_form_version"] = form_version + 1
                 action = "Muudetud" if existing_row else "Salvestatud"
                 st.session_state["harvest_saved_message"] = (
@@ -1415,17 +1391,26 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
         readiness_start = SEASON_START
         harvest_rows = db.get_harvest_history(limit=2000)
 
-        # Korjepäevad ja viimane täielik 3/3 päev. Pooleliolevat tänast päeva õppesse ei võeta.
+        # Korjepäevad ja viimane täielik päev. Uutel päevadel tähendab "täielik", et
+        # kõik selleks päevaks valitud põllud on sisestatud. Vanadel päevadel, mille
+        # tööplaani veel ei salvestatud, kasutame tagasiühilduvuseks senist 3-põllu reeglit.
         harvest_by_day = {}
         for row in harvest_rows:
             day_str = str(row.get("harvest_date") or "")
             if day_str:
                 harvest_by_day.setdefault(day_str, []).append(row)
+        saved_harvest_plans = db.get_harvest_plans()
 
         complete_harvest_days = []
         for day_str, day_rows in harvest_by_day.items():
             fields = {int(r.get("field_no")) for r in day_rows if r.get("field_no") is not None}
-            if len(day_rows) == 3 and len(fields) == 3:
+            expected_plan = saved_harvest_plans.get(day_str)
+            if expected_plan is not None:
+                expected_fields = set(int(f) for f in expected_plan)
+                day_complete = bool(expected_fields) and fields == expected_fields and len(day_rows) == len(expected_fields)
+            else:
+                day_complete = len(day_rows) == 3 and len(fields) == 3
+            if day_complete:
                 try:
                     complete_harvest_days.append(date.fromisoformat(day_str))
                 except ValueError:
@@ -1487,7 +1472,7 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
         missing_fields = [f for f in range(1, 15) if f not in represented_fields]
 
         # Mõõdetud ööpäevailma saab ausalt nõuda ainult lõpetatud kalendripäevadelt.
-        # Tänast päeva ei märgita enam puuduvaks isegi siis, kui tänane 3/3 korje on juba sisestatud.
+        # Tänast päeva ei märgita enam puuduvaks isegi siis, kui tänaseks valitud korjed on juba sisestatud.
         weather_target_end = min(last_complete_harvest, TODAY - timedelta(days=1)) if last_complete_harvest else None
         weather_missing = []
         weather_rows = []
@@ -1830,9 +1815,36 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                     ])) if sample["interval_days"] > 0 else _daylength_hours(sample["current_day"]),
                 }
 
+            def _lookback_weather(n):
+                # Pikem ilmamälu võib ulatuda üle eelmise korje piiri. See on ainult
+                # Jäljeotsija kandidaat, mitte baasmudeli kohustuslik sisend.
+                lookback = []
+                d0 = sample["current_day"] - timedelta(days=n - 1)
+                d = d0
+                while d <= sample["current_day"]:
+                    wr = weather_by_day.get(d.isoformat())
+                    if not wr or not _weather_day_ok(d):
+                        return {
+                            f"ÖöT {n}p": None, f"PäevT {n}p": None, f"Rad {n}p": None,
+                            f"Sade {n}p": None, f"ET0 {n}p": None, f"Niiskus {n}p": None,
+                        }
+                    lookback.append(wr)
+                    d += timedelta(days=1)
+                return {
+                    f"ÖöT {n}p": float(np.mean([_n(w.get("temp_night_avg_c")) for w in lookback])),
+                    f"PäevT {n}p": float(np.mean([_n(w.get("temp_day_avg_c")) for w in lookback])),
+                    f"Rad {n}p": float(np.sum([_n(w.get("radiation_mj_m2")) for w in lookback])),
+                    f"Sade {n}p": float(np.sum([_n(w.get("precipitation_mm")) for w in lookback])),
+                    f"ET0 {n}p": float(np.sum([_n(w.get("et0_mm")) for w in lookback])),
+                    f"Niiskus {n}p": float(np.mean([_n(w.get("humidity_avg_pct")) for w in lookback])),
+                }
+
             tail1 = _tail_weather(1)
             tail2 = _tail_weather(2)
             tail3 = _tail_weather(3)
+            lookback7 = _lookback_weather(7)
+            lookback10 = _lookback_weather(10)
+            lookback14 = _lookback_weather(14)
 
             temp_curve = _temperature_curve_features(night_t, day_t)
 
@@ -1840,6 +1852,7 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                 "Kuupäev": sample["current_day"],
                 "Põld": sample["field_no"],
                 "Intervall p": sample["interval_days"],
+                **_season_curve_features(sample["current_day"], SEASON_START),
                 "Saak": target_total,
                 "ABC saak": target_abc,
                 "C/B siht": target_cb,
@@ -1900,7 +1913,7 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                 "2 korje koormus": prev_load.get("2 korje koormus"),
                 "Tipukorje -1": prev_load.get("Tipukorje -1"),
                 "Tipukorje -2": prev_load.get("Tipukorje -2"),
-                **tail1, **tail2, **tail3,
+                **tail1, **tail2, **tail3, **lookback7, **lookback10, **lookback14,
                 "Andmekvaliteet": current_row.get("data_quality") or "",
             })
 
@@ -2024,77 +2037,22 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
             raw_cb1 = pd.to_numeric(model_df["C/B -1"], errors="coerce").to_numpy(dtype=float)
             raw_cb2 = pd.to_numeric(model_df["C/B -2"], errors="coerce").to_numpy(dtype=float)
 
+            # Mudeli lineaaralgebra elab model_engine.py-s; siin seome selle tänase andmestikuga.
             def _build_ridge_design(train_idx, test_idx, extra_arrays):
-                tr_parts = [X_base[train_idx]]
-                te_parts = [X_base[test_idx]]
-                tr_missing_parts, te_missing_parts = [], []
-                fills = []
-                for arr in extra_arrays:
-                    tr = arr[train_idx]
-                    te = arr[test_idx]
-                    finite = tr[np.isfinite(tr)]
-                    fill = float(np.median(finite)) if len(finite) else 0.0
-                    fills.append(fill)
-                    tr_parts.append(np.where(np.isfinite(tr), tr, fill).reshape(-1, 1))
-                    te_parts.append(np.where(np.isfinite(te), te, fill).reshape(-1, 1))
-                    tr_missing_parts.append((~np.isfinite(tr)).astype(float).reshape(-1, 1))
-                    te_missing_parts.append((~np.isfinite(te)).astype(float).reshape(-1, 1))
-                xtr = np.column_stack(tr_parts)
-                xte = np.column_stack(te_parts)
-                means = xtr.mean(axis=0)
-                scales = xtr.std(axis=0)
-                scales[scales < 1e-9] = 1.0
-                ztr = (xtr - means) / scales
-                zte = (xte - means) / scales
-                ftr = np.zeros((len(train_idx), 14), dtype=float)
-                fte = np.zeros((len(test_idx), 14), dtype=float)
-                for ri, f in enumerate(fields[train_idx]):
-                    if 1 <= int(f) <= 14:
-                        ftr[ri, int(f) - 1] = 1.0
-                for ri, f in enumerate(fields[test_idx]):
-                    if 1 <= int(f) <= 14:
-                        fte[ri, int(f) - 1] = 1.0
-                tr_missing = np.column_stack(tr_missing_parts) if tr_missing_parts else np.empty((len(train_idx), 0))
-                te_missing = np.column_stack(te_missing_parts) if te_missing_parts else np.empty((len(test_idx), 0))
-                Xtr = np.column_stack([np.ones(len(train_idx)), ztr, tr_missing, ftr])
-                Xte = np.column_stack([np.ones(len(test_idx)), zte, te_missing, fte])
-                return Xtr, Xte, means, scales, fills
+                return _engine_build_ridge_design(X_base, fields, train_idx, test_idx, extra_arrays)
 
             def _ridge_walk_predict(target, extra_arrays, train_idx, test_idx, alpha=10.0, floor_zero=True, field_alpha=80.0):
-                Xtr, Xte, _, _, _ = _build_ridge_design(train_idx, test_idx, extra_arrays)
-                penalty = np.eye(Xtr.shape[1]) * alpha
-                penalty[0, 0] = 0.0
-                # 14 viimast veergu on põllu one-hot tunnused. Õppimisandmestik on veel väike,
-                # seetõttu kasutame siin tugevat partial-pooling kahandamist: põllu eripära jääb
-                # alles, kuid ei tohi üksinda weather-first prognoosi nulli/äärmusse suruda.
-                penalty[-14:, -14:] = np.eye(14) * field_alpha
-                beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ target[train_idx]
-                values = Xte @ beta
-                return np.maximum(values, 0.0) if floor_zero else values
+                return _engine_ridge_walk_predict(
+                    X_base, fields, target, extra_arrays, train_idx, test_idx,
+                    alpha=alpha, floor_zero=floor_zero, field_alpha=field_alpha,
+                )
 
             def _abc_growth_walk_predict(extra_arrays, train_idx, test_idx, alpha=10.0, field_alpha=80.0, z_clip=2.5):
-                """V6.4 A+B+C: multiplicative/positive growth-potential model.
-
-                Õpib log(A+B+C) multiplikatiivsel skaalal. Ilma ja muude pidevate tunnuste z-skoorid
-                piiratakse treeningu mõistlikku vahemikku, et 6–9 päeva prognoosi
-                ekstreemne ilm ei saaks lineaarset latentset mudelit absurdselt ekstrapoleerida.
-                """
-                valid_train = train_idx[np.isfinite(log_y_abc[train_idx])]
-                if len(valid_train) < min_train_rows:
-                    return np.full(len(test_idx), np.nan, dtype=float)
-                Xtr, Xte, _, _, _ = _build_ridge_design(valid_train, test_idx, extra_arrays)
-                n_numeric = X_base.shape[1] + len(extra_arrays)
-                # intercept on veerg 0; sellele järgnevad standardiseeritud arvulised tunnused
-                Xtr[:, 1:1+n_numeric] = np.clip(Xtr[:, 1:1+n_numeric], -z_clip, z_clip)
-                Xte[:, 1:1+n_numeric] = np.clip(Xte[:, 1:1+n_numeric], -z_clip, z_clip)
-                penalty = np.eye(Xtr.shape[1]) * alpha
-                penalty[0, 0] = 0.0
-                penalty[-14:, -14:] = np.eye(14) * field_alpha
-                beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ log_y_abc[valid_train]
-                latent = Xte @ beta
-                # exp() teeb mudeli multiplikatiivseks ja positiivseks. Väga halb ilm võib
-                # viia prognoosi väga madalale, kuid mitte lineaarse algebra tõttu negatiivseks.
-                return np.exp(np.clip(latent, np.log(ABC_LOG_EPS), 6.0))
+                return _engine_abc_growth_walk_predict(
+                    X_base, fields, log_y_abc, extra_arrays, train_idx, test_idx,
+                    min_train_rows=min_train_rows, alpha=alpha, field_alpha=field_alpha,
+                    z_clip=z_clip, log_eps=ABC_LOG_EPS,
+                )
 
             min_train_rows = 10
             abc_predictions = np.full(len(model_df), np.nan, dtype=float)
@@ -2210,6 +2168,11 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                 "Viimase 1 päeva ilm": ["ÖöT viim1", "PäevT viim1", "Rad viim1", "Sade viim1", "ET0 viim1", "Niiskus viim1"],
                 "Viimase 2 päeva ilm": ["ÖöT viim2", "PäevT viim2", "Rad viim2", "Sade viim2", "ET0 viim2", "Niiskus viim2"],
                 "Viimase 3 päeva ilm": ["ÖöT viim3", "PäevT viim3", "Rad viim3", "Sade viim3", "ET0 viim3", "Niiskus viim3"],
+                # Pikem ilmamälu ulatub teadlikult üle eelmise korje piiri.
+                # Need on ainult kandidaadid; baasmudel jääb korjest-korjeni weather-first.
+                "7 päeva ilmamälu": ["ÖöT 7p", "PäevT 7p", "Rad 7p", "Sade 7p", "ET0 7p", "Niiskus 7p"],
+                "10 päeva ilmamälu": ["ÖöT 10p", "PäevT 10p", "Rad 10p", "Sade 10p", "ET0 10p", "Niiskus 10p"],
+                "14 päeva ilmamälu": ["ÖöT 14p", "PäevT 14p", "Rad 14p", "Sade 14p", "ET0 14p", "Niiskus 14p"],
 
                 # Ööd / temperatuur
                 "Soojad ööd 16+": ["Soojad ööd 16+ %"],
@@ -2231,6 +2194,13 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                 "Tuulestress viim1": ["Tuul×Tmax viim1", "Tuul×Rad/p viim1", "Tuul×ET0/p viim1", "Tuul×Kuivus viim1"],
                 "Tuulestress viim2": ["Tuul×Tmax viim2", "Tuul×Rad/p viim2", "Tuul×ET0/p viim2", "Tuul×Kuivus viim2"],
                 "Tuulestress viim3": ["Tuul×Tmax viim3", "Tuul×Rad/p viim3", "Tuul×ET0/p viim3", "Tuul×Kuivus viim3"],
+
+                # Hooaja / taime kulumise mittelineaarne kuju.
+                # Languse märki ei kirjutata ette; avastus+kinnitus peab kasu tõestama.
+                "Hooaja kaar": ["Hooajapäev²"],
+                "Hooaja faasivahetused": ["Hooaeg 35+", "Hooaeg 50+", "Hooaeg 65+"],
+                "Hilishooaja kulumiskõver": ["Hooaeg 50+", "Hooaeg 50+²", "Hooaeg 65+"],
+                "Paindlik hooajakõver": ["Hooajapäev²", "Hooaeg 35+", "Hooaeg 50+", "Hooaeg 65+"],
 
                 # Fotoperiood
                 "Päevapikkus": ["Päevapikkus"],
@@ -2269,36 +2239,65 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                     preds[test_idx] = _abc_growth_walk_predict(extra_arrays, train_idx, test_idx)
                 return preds
 
-            def _stability_stats(candidate_pred):
-                mask = np.isfinite(predictions) & np.isfinite(candidate_pred)
+            def _chronological_discovery_confirmation_days(base_pred, target):
+                # Ühine statistiline valikupoliitika asub model_engine.py-s.
+                return _engine_discovery_confirmation_days(dates, base_pred, target)
+
+            def _period_stability_stats(
+                base_pred, candidate_pred, target, day_set,
+                *, min_rows, improvement_threshold, min_half_threshold,
+            ):
+                if not day_set:
+                    return None
+                mask = (
+                    np.isfinite(base_pred)
+                    & np.isfinite(candidate_pred)
+                    & np.isfinite(target)
+                    & np.array([d in day_set for d in dates], dtype=bool)
+                )
                 idx = np.where(mask)[0]
                 if len(idx) == 0:
                     return None
-                base_abs = np.abs(predictions[idx] - y[idx])
-                cand_abs = np.abs(candidate_pred[idx] - y[idx])
+                base_abs = np.abs(base_pred[idx] - target[idx])
+                cand_abs = np.abs(candidate_pred[idx] - target[idx])
                 base_mae = float(base_abs.mean())
                 cand_mae = float(cand_abs.mean())
                 improvement = base_mae - cand_mae
                 win_share = float(np.mean(cand_abs < base_abs))
-                # Ajalise stabiilsuse kontroll: sama testipäeva põllud jäävad alati samasse poolde.
                 unique_test_days = sorted(set(dates[idx]))
                 day_halves = np.array_split(np.array(unique_test_days, dtype=object), 2)
                 half_improvements = []
                 for day_half in day_halves:
-                    day_set = set(day_half.tolist())
-                    h = np.array([i for i in idx if dates[i] in day_set], dtype=int)
+                    day_subset = set(day_half.tolist())
+                    h = np.array([i for i in idx if dates[i] in day_subset], dtype=int)
                     if len(h) == 0:
                         continue
                     half_improvements.append(float(
-                        np.mean(np.abs(predictions[h] - y[h])) - np.mean(np.abs(candidate_pred[h] - y[h]))
+                        np.mean(np.abs(base_pred[h] - target[h]))
+                        - np.mean(np.abs(candidate_pred[h] - target[h]))
                     ))
                 min_half = min(half_improvements) if half_improvements else -999.0
-                stable = bool(len(idx) >= 12 and improvement >= 0.10 and win_share >= 0.50 and min_half >= -0.05)
+                stable = bool(
+                    len(idx) >= min_rows
+                    and improvement >= improvement_threshold
+                    and win_share >= 0.50
+                    and min_half >= min_half_threshold
+                )
                 return {
                     "Baas MAE": base_mae, "Katse MAE": cand_mae, "Paranemine": improvement,
                     "Võidab ridu %": win_share * 100.0, "Halvim pool": min_half,
-                    "Testiridu": int(len(idx)), "Stabiilne": stable,
+                    "Testiridu": int(len(idx)), "Testipäevi": int(len(unique_test_days)), "Stabiilne": stable,
                 }
+
+            _abc_discovery_days, _abc_confirmation_days = _chronological_discovery_confirmation_days(predictions, y)
+
+            def _stability_stats(candidate_pred):
+                # Üldine diagnostika kogu walk-forward ajalool; championit selle järgi enam ei valita.
+                all_days = set(sorted(set(dates[np.where(np.isfinite(predictions) & np.isfinite(y))[0]])))
+                return _period_stability_stats(
+                    predictions, candidate_pred, y, all_days,
+                    min_rows=12, improvement_threshold=0.10, min_half_threshold=-0.05,
+                )
 
             trace_results = []
             candidate_predictions = {}
@@ -2317,18 +2316,42 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
             champion_cols = []
             champion_pred = predictions.copy()
             champion_mae = current_test_mae
-            stable_operational = []
+            champion_stats = None
+            champion_discovery_stats = None
+
+            # Kaheastmeline champion-valik:
+            # 1) vali kandidaat ainult varasemal avastusperioodil;
+            # 2) kontrolli ainult seda üht kandidaati hilisemal puutumata kinnitusaajal.
+            # Kui kinnitusaega pole piisavalt või kandidaat seal ei püsi, jääb baasmudel.
+            discovery_operational = []
             for name, cols in operational_candidate_groups.items():
-                if name not in candidate_predictions:
+                cp = candidate_predictions.get(name)
+                if cp is None:
                     continue
-                stats = _stability_stats(candidate_predictions[name])
-                if stats and stats["Stabiilne"]:
-                    stable_operational.append((stats["Katse MAE"], name, cols, candidate_predictions[name], stats))
-            if stable_operational:
-                stable_operational.sort(key=lambda x: x[0])
-                champion_mae, champion_name, champion_cols, champion_pred, champion_stats = stable_operational[0]
-            else:
-                champion_stats = None
+                d_stats = _period_stability_stats(
+                    predictions, cp, y, _abc_discovery_days,
+                    min_rows=6, improvement_threshold=0.10, min_half_threshold=-0.05,
+                )
+                if d_stats and d_stats["Stabiilne"]:
+                    discovery_operational.append((d_stats["Katse MAE"], name, cols, cp, d_stats))
+
+            if discovery_operational and _abc_confirmation_days:
+                discovery_operational.sort(key=lambda x: x[0])
+                _, selected_name, selected_cols, selected_pred, selected_discovery_stats = discovery_operational[0]
+                confirm_stats = _period_stability_stats(
+                    predictions, selected_pred, y, _abc_confirmation_days,
+                    min_rows=6, improvement_threshold=0.05, min_half_threshold=-0.05,
+                )
+                if confirm_stats and confirm_stats["Stabiilne"]:
+                    champion_name = selected_name
+                    champion_cols = selected_cols
+                    champion_pred = selected_pred
+                    champion_mae = confirm_stats["Katse MAE"]
+                    champion_stats = dict(confirm_stats)
+                    champion_discovery_stats = selected_discovery_stats
+                    champion_stats["Avastus MAE"] = selected_discovery_stats["Katse MAE"]
+                    champion_stats["Avastus paranemine"] = selected_discovery_stats["Paranemine"]
+                    champion_stats["Kinnitusperiood"] = True
 
 
             # -------------------------------------------------------------------------
@@ -2346,7 +2369,7 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
             except (TypeError, ValueError):
                 _last_full_idea_count = 0
 
-            # Lai loominguline otsing: alguses iga 3 uue täieliku 3/3 korjepäeva järel.
+            # Lai loominguline otsing: alguses iga 3 uue täieliku korjepäeva järel.
             # Vahepeal kontrollib tavaline Jäljeotsija olemasolevaid kandidaate.
             AUTONOMOUS_DISCOVERY_ENABLED = bool(
                 _complete_day_count >= _last_full_idea_count + IDEA_FULL_SEARCH_EVERY_COMPLETE_DAYS
@@ -2765,15 +2788,16 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
             if champion_stats:
                 ch3.metric("Eelis baasi ees", f"{champion_stats['Paranemine']:+.2f} kasti")
                 st.success(
-                    f"9 päeva prognoos kasutab automaatselt championit **{champion_name}**. "
-                    f"See võitis {champion_stats['Võidab ridu %']:.0f}% samadest testiridadest ja "
-                    f"parandas MAE-d {champion_stats['Paranemine']:.2f} kasti. "
-                    "Champion vaadatakse iga uue korjega uuesti üle."
+                    f"9 päeva prognoos kasutab kinnitatud championit **{champion_name}**. "
+                    f"Kandidaat valiti varasemal avastusperioodil ja alles seejärel kontrolliti "
+                    f"hilisemal puutumata kinnitusaajal. Kinnituses võitis ta "
+                    f"{champion_stats['Võidab ridu %']:.0f}% testiridadest ning parandas MAE-d "
+                    f"{champion_stats['Paranemine']:.2f} kasti. Champion vaadatakse iga uue korjega uuesti üle."
                 )
             else:
                 ch3.metric("Eelis baasi ees", "0.00 kasti")
                 st.info(
-                    "Ükski ilmast ega bioloogilisest koormusest tuletatud lisajälg ei läbinud täna stabiilsuslävendit. "
+                    "Ükski ilmast ega bioloogilisest koormusest tuletatud lisajälg ei läbinud eraldi avastus- ja kinnitusetappi. "
                     "9 päeva prognoos kasutab seetõttu puhast ilma + intervalli + hooaja faasi + põllu baasmudelit. "
                     "Toorest eelmist saaki, saagitrendi, XL-i ega C/B-d Jäljeotsija prognoosi ankruks ei luba."
                 )
@@ -2816,42 +2840,14 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                     )
                 return preds
 
+            _xl_discovery_days, _xl_confirmation_days = _chronological_discovery_confirmation_days(xl_predictions, y_xl)
+
             def _xl_stability_stats(candidate_pred):
-                mask = np.isfinite(xl_predictions) & np.isfinite(candidate_pred) & np.isfinite(y_xl)
-                idx = np.where(mask)[0]
-                if len(idx) == 0:
-                    return None
-                base_abs = np.abs(xl_predictions[idx] - y_xl[idx])
-                cand_abs = np.abs(candidate_pred[idx] - y_xl[idx])
-                improvement = float(base_abs.mean() - cand_abs.mean())
-                win_share = float(np.mean(cand_abs < base_abs))
-                unique_days = sorted(set(dates[idx]))
-                halves = np.array_split(np.array(unique_days, dtype=object), 2)
-                half_improvements = []
-                for half in halves:
-                    day_set = set(half.tolist())
-                    h = np.array([i for i in idx if dates[i] in day_set], dtype=int)
-                    if len(h):
-                        half_improvements.append(float(
-                            np.mean(np.abs(xl_predictions[h] - y_xl[h]))
-                            - np.mean(np.abs(candidate_pred[h] - y_xl[h]))
-                        ))
-                min_half = min(half_improvements) if half_improvements else -999.0
-                stable = bool(
-                    len(idx) >= 12
-                    and improvement >= 0.05
-                    and win_share >= 0.50
-                    and min_half >= -0.05
+                all_days = set(sorted(set(dates[np.where(np.isfinite(xl_predictions) & np.isfinite(y_xl))[0]])))
+                return _period_stability_stats(
+                    xl_predictions, candidate_pred, y_xl, all_days,
+                    min_rows=12, improvement_threshold=0.05, min_half_threshold=-0.05,
                 )
-                return {
-                    "Baas MAE": float(base_abs.mean()),
-                    "Katse MAE": float(cand_abs.mean()),
-                    "Paranemine": improvement,
-                    "Võidab ridu %": win_share * 100.0,
-                    "Halvim pool": min_half,
-                    "Testiridu": int(len(idx)),
-                    "Stabiilne": stable,
-                }
 
             xl_candidate_predictions = {}
             xl_trace_rows = []
@@ -2869,27 +2865,44 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                 if valid_xl.any() else None
             )
             xl_champion_stats = None
-            xl_stable = []
+            xl_discovery = []
             for name, cols in xl_candidate_groups.items():
-                stats = _xl_stability_stats(xl_candidate_predictions.get(name))
-                if stats and stats["Stabiilne"]:
-                    xl_stable.append((stats["Katse MAE"], name, cols, stats))
-            if xl_stable:
-                xl_stable.sort(key=lambda x: x[0])
-                xl_champion_mae, xl_champion_name, xl_champion_cols, xl_champion_stats = xl_stable[0]
+                cp = xl_candidate_predictions.get(name)
+                if cp is None:
+                    continue
+                d_stats = _period_stability_stats(
+                    xl_predictions, cp, y_xl, _xl_discovery_days,
+                    min_rows=6, improvement_threshold=0.05, min_half_threshold=-0.05,
+                )
+                if d_stats and d_stats["Stabiilne"]:
+                    xl_discovery.append((d_stats["Katse MAE"], name, cols, cp, d_stats))
+            if xl_discovery and _xl_confirmation_days:
+                xl_discovery.sort(key=lambda x: x[0])
+                _, selected_name, selected_cols, selected_pred, selected_discovery_stats = xl_discovery[0]
+                confirm_stats = _period_stability_stats(
+                    xl_predictions, selected_pred, y_xl, _xl_confirmation_days,
+                    min_rows=6, improvement_threshold=0.03, min_half_threshold=-0.05,
+                )
+                if confirm_stats and confirm_stats["Stabiilne"]:
+                    xl_champion_name = selected_name
+                    xl_champion_cols = selected_cols
+                    xl_champion_mae = confirm_stats["Katse MAE"]
+                    xl_champion_stats = dict(confirm_stats)
+                    xl_champion_stats["Avastus MAE"] = selected_discovery_stats["Katse MAE"]
+                    xl_champion_stats["Avastus paranemine"] = selected_discovery_stats["Paranemine"]
 
             xl1, xl2 = st.columns(2)
             xl1.metric("XL champion", xl_champion_name)
             xl2.metric("XL MAE", "—" if xl_champion_mae is None else f"{xl_champion_mae:.2f}")
             if xl_champion_stats:
                 st.success(
-                    f"XL kasutab **{xl_champion_name}**: MAE paranemine "
-                    f"{xl_champion_stats['Paranemine']:.2f}, võitis "
-                    f"{xl_champion_stats['Võidab ridu %']:.0f}% testiridadest."
+                    f"XL kasutab kinnitatud championit **{xl_champion_name}**: hilisemal kinnitusaajal "
+                    f"paranes MAE {xl_champion_stats['Paranemine']:.2f} ja kandidaat võitis "
+                    f"{xl_champion_stats['Võidab ridu %']:.0f}% kinnitusridadest."
                 )
             else:
                 st.info(
-                    "Ükski XL mälutunnus ega lisajälg ei läbinud stabiilsuslävendit; "
+                    "Ükski XL mälutunnus ega lisajälg ei läbinud eraldi avastus- ja kinnitusetappi; "
                     "XL kasutab weather-first baasmudelit."
                 )
 
@@ -2932,32 +2945,14 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                     preds[test_idx] = np.exp(np.clip(log_pred, np.log(0.10), np.log(10.0)))
                 return preds
 
+            _cb_discovery_days, _cb_confirmation_days = _chronological_discovery_confirmation_days(cb_predictions, y_cb)
+
             def _cb_stability_stats(candidate_pred):
-                mask = np.isfinite(cb_predictions) & np.isfinite(candidate_pred) & np.isfinite(y_cb)
-                idx = np.where(mask)[0]
-                if len(idx) == 0:
-                    return None
-                base_abs = np.abs(cb_predictions[idx] - y_cb[idx])
-                cand_abs = np.abs(candidate_pred[idx] - y_cb[idx])
-                improvement = float(base_abs.mean() - cand_abs.mean())
-                win_share = float(np.mean(cand_abs < base_abs))
-                unique_days = sorted(set(dates[idx]))
-                halves = np.array_split(np.array(unique_days, dtype=object), 2)
-                half_improvements = []
-                for half in halves:
-                    day_set = set(half.tolist())
-                    h = np.array([i for i in idx if dates[i] in day_set], dtype=int)
-                    if len(h):
-                        half_improvements.append(float(
-                            np.mean(np.abs(cb_predictions[h] - y_cb[h])) - np.mean(np.abs(candidate_pred[h] - y_cb[h]))
-                        ))
-                min_half = min(half_improvements) if half_improvements else -999.0
-                stable = bool(len(idx) >= 12 and improvement >= 0.05 and win_share >= 0.50 and min_half >= -0.03)
-                return {
-                    "Baas MAE": float(base_abs.mean()), "Katse MAE": float(cand_abs.mean()),
-                    "Paranemine": improvement, "Võidab ridu %": win_share * 100.0,
-                    "Halvim pool": min_half, "Testiridu": int(len(idx)), "Stabiilne": stable,
-                }
+                all_days = set(sorted(set(dates[np.where(np.isfinite(cb_predictions) & np.isfinite(y_cb))[0]])))
+                return _period_stability_stats(
+                    cb_predictions, candidate_pred, y_cb, all_days,
+                    min_rows=12, improvement_threshold=0.05, min_half_threshold=-0.03,
+                )
 
             cb_candidate_predictions = {}
             cb_trace_rows = []
@@ -2972,14 +2967,31 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
             cb_champion_cols = []
             cb_champion_mae = cb_base_mae
             cb_champion_stats = None
-            cb_stable = []
+            cb_discovery = []
             for name, cols in cb_candidate_groups.items():
-                stats = _cb_stability_stats(cb_candidate_predictions.get(name)) if name in cb_candidate_predictions else None
-                if stats and stats["Stabiilne"]:
-                    cb_stable.append((stats["Katse MAE"], name, cols, stats))
-            if cb_stable:
-                cb_stable.sort(key=lambda x: x[0])
-                cb_champion_mae, cb_champion_name, cb_champion_cols, cb_champion_stats = cb_stable[0]
+                cp = cb_candidate_predictions.get(name)
+                if cp is None:
+                    continue
+                d_stats = _period_stability_stats(
+                    cb_predictions, cp, y_cb, _cb_discovery_days,
+                    min_rows=6, improvement_threshold=0.05, min_half_threshold=-0.03,
+                )
+                if d_stats and d_stats["Stabiilne"]:
+                    cb_discovery.append((d_stats["Katse MAE"], name, cols, cp, d_stats))
+            if cb_discovery and _cb_confirmation_days:
+                cb_discovery.sort(key=lambda x: x[0])
+                _, selected_name, selected_cols, selected_pred, selected_discovery_stats = cb_discovery[0]
+                confirm_stats = _period_stability_stats(
+                    cb_predictions, selected_pred, y_cb, _cb_confirmation_days,
+                    min_rows=6, improvement_threshold=0.03, min_half_threshold=-0.03,
+                )
+                if confirm_stats and confirm_stats["Stabiilne"]:
+                    cb_champion_name = selected_name
+                    cb_champion_cols = selected_cols
+                    cb_champion_mae = confirm_stats["Katse MAE"]
+                    cb_champion_stats = dict(confirm_stats)
+                    cb_champion_stats["Avastus MAE"] = selected_discovery_stats["Katse MAE"]
+                    cb_champion_stats["Avastus paranemine"] = selected_discovery_stats["Paranemine"]
 
             cb1, cb2, cb3 = st.columns(3)
             cb1.metric("C/B champion", cb_champion_name)
@@ -2990,11 +3002,12 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
             st.caption(f"C/B aus test hõlmab {cb_test_days} testipäeva. Madalam MAE on parem.")
             if cb_champion_stats:
                 st.success(
-                    f"C/B prognoos kasutab **{cb_champion_name}**: MAE paranemine {cb_champion_stats['Paranemine']:.2f}, "
-                    f"võitis {cb_champion_stats['Võidab ridu %']:.0f}% samadest testiridadest."
+                    f"C/B prognoos kasutab kinnitatud championit **{cb_champion_name}**: hilisemal kinnitusaajal "
+                    f"paranes MAE {cb_champion_stats['Paranemine']:.2f} ja kandidaat võitis "
+                    f"{cb_champion_stats['Võidab ridu %']:.0f}% kinnitusridadest."
                 )
             else:
-                st.info("Ükski C/B lisajälg ei läbinud stabiilsuslävendit; kvaliteediprognoos kasutab C/B baasmudelit.")
+                st.info("Ükski C/B lisajälg ei läbinud eraldi avastus- ja kinnitusetappi; kvaliteediprognoos kasutab C/B baasmudelit.")
 
             if cb_trace_rows:
                 with st.expander("Näita C/B jäljeotsija tulemusi"):
@@ -3005,73 +3018,25 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                     }), use_container_width=True, hide_index=True)
 
             def _fit_full_generic(target, extra_arrays, alpha=10.0, field_alpha=80.0):
-                idx = np.where(np.isfinite(target))[0]
-                Xtr, _, means, scales, fills = _build_ridge_design(idx, idx, extra_arrays)
-                penalty = np.eye(Xtr.shape[1]) * alpha
-                penalty[0, 0] = 0.0
-                # Partial pooling põldudele: 14 viimast koefitsienti saavad tugevama
-                # regulaaristuse kui ilma/hooaja tunnused. Nii ei õpi 2–3 korjerea põhjal
-                # mõne põllu jaoks kunstlikku suurt negatiivset/positiivset püsiefekti.
-                penalty[-14:, -14:] = np.eye(14) * field_alpha
-                beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ target
-                return {"beta": beta, "means": means, "scales": scales, "fills": fills, "n_extra": len(extra_arrays)}
+                return _engine_fit_full_generic(
+                    X_base, fields, target, extra_arrays, alpha=alpha, field_alpha=field_alpha,
+                )
 
             def _predict_full_generic(model, field_no, base_values, extra_values, floor_zero=True):
-                x = list(base_values)
-                miss = []
-                for i, value in enumerate(extra_values):
-                    if value is None or not np.isfinite(float(value)):
-                        x.append(model["fills"][i])
-                        miss.append(1.0)
-                    else:
-                        x.append(float(value))
-                        miss.append(0.0)
-                x = np.array([x], dtype=float)
-                z = (x - model["means"]) / model["scales"]
-                onehot = np.zeros((1, 14), dtype=float)
-                if 1 <= int(field_no) <= 14:
-                    onehot[0, int(field_no) - 1] = 1.0
-                Xp = np.column_stack([np.ones(1), z, np.array([miss], dtype=float), onehot])
-                value = float((Xp @ model["beta"])[0])
-                return max(0.0, value) if floor_zero else value
+                return _engine_predict_full_generic(
+                    model, field_no, base_values, extra_values, floor_zero=floor_zero,
+                )
 
             def _fit_full_abc_growth(extra_arrays, alpha=10.0, field_alpha=80.0, z_clip=2.5):
-                idx = np.where(np.isfinite(log_y_abc))[0]
-                Xtr, _, means, scales, fills = _build_ridge_design(idx, idx, extra_arrays)
-                n_numeric = X_base.shape[1] + len(extra_arrays)
-                Xtr[:, 1:1+n_numeric] = np.clip(Xtr[:, 1:1+n_numeric], -z_clip, z_clip)
-                penalty = np.eye(Xtr.shape[1]) * alpha
-                penalty[0, 0] = 0.0
-                penalty[-14:, -14:] = np.eye(14) * field_alpha
-                beta = np.linalg.pinv(Xtr.T @ Xtr + penalty) @ Xtr.T @ log_y_abc[idx]
-                return {
-                    "beta": beta, "means": means, "scales": scales, "fills": fills,
-                    "n_extra": len(extra_arrays), "z_clip": z_clip,
-                }
+                return _engine_fit_full_abc_growth(
+                    X_base, fields, log_y_abc, extra_arrays, alpha=alpha,
+                    field_alpha=field_alpha, z_clip=z_clip,
+                )
 
             def _predict_full_abc_growth(model, field_no, base_values, extra_values):
-                x = list(base_values)
-                miss = []
-                for i, value in enumerate(extra_values):
-                    try:
-                        finite_value = value is not None and np.isfinite(float(value))
-                    except (TypeError, ValueError):
-                        finite_value = False
-                    if not finite_value:
-                        x.append(model["fills"][i])
-                        miss.append(1.0)
-                    else:
-                        x.append(float(value))
-                        miss.append(0.0)
-                x = np.array([x], dtype=float)
-                z = (x - model["means"]) / model["scales"]
-                z = np.clip(z, -model.get("z_clip", 2.5), model.get("z_clip", 2.5))
-                onehot = np.zeros((1, 14), dtype=float)
-                if 1 <= int(field_no) <= 14:
-                    onehot[0, int(field_no) - 1] = 1.0
-                Xp = np.column_stack([np.ones(1), z, np.array([miss], dtype=float), onehot])
-                latent = float((Xp @ model["beta"])[0])
-                return float(np.exp(np.clip(latent, np.log(ABC_LOG_EPS), 6.0)))
+                return _engine_predict_full_abc_growth(
+                    model, field_no, base_values, extra_values, log_eps=ABC_LOG_EPS,
+                )
 
             def _abc_growth_explain(model, field_no, base_values, extra_values, extra_names):
                 """Jaga V6.4 log-mudeli prognoos täpselt +/- kastipanusteks.
@@ -3113,7 +3078,7 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                 def _group_for_feature(name):
                     if name == "Intervall p":
                         return "Intervall"
-                    if name == "Hooajapäev":
+                    if name == "Hooajapäev" or str(name).startswith("Hooaeg"):
                         return "Hooaeg"
                     if (
                         name in {"T kesk", "Tmin kesk", "Tmax kesk", "Tmin min", "Tmax max"}
@@ -3193,13 +3158,28 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
             ]
             full_cb_model = _fit_full_generic(log_y_cb, cb_champion_extra_arrays)
 
+            # Rekursiivses 9 päeva prognoosis ei tohi XL ega C/B omaenda varasemaid
+            # prognoose toore mälutunnusena tagasi sisendisse sööta. Ilmapõhine champion
+            # võib jätkuda; mäluchampioni korral kasutatakse prognoositud eelkorje järel baasmudelit.
+            xl_memory_feature_names = {"XL -1", "XL -2", "Eelmine ABC", "Eelmine saak"}
+            cb_memory_feature_names = {
+                "C/B -1", "C/B -2", "Eelmine2 ABC", "ABC trend",
+                "XL -1", "XL -2", "XL osakaal -1", "XL osakaal -2",
+            }
+            xl_champion_uses_memory = any(c in xl_memory_feature_names for c in xl_champion_cols)
+            cb_champion_uses_memory = any(c in cb_memory_feature_names for c in cb_champion_cols)
+            full_xl_base_model = _fit_full_generic(y_xl, [])
+            full_cb_base_model = _fit_full_generic(log_y_cb, [])
+
             # -------------------------------------------------------------------------
             # 9 päeva ette: A+B+C + eraldi XL
             # -------------------------------------------------------------------------
             st.markdown("##### 9 päeva saagiprognoos")
             st.caption(
                 f"A+B+C kasutab tänast champion-mootorit: {champion_name}. Baasmudel põhineb ilmal, intervallil, "
-                f"hooaja faasil ja põllu identiteedil. Tõestatud normaliseeritud bioloogiline koormus võib baasi korrigeerida, "
+                f"hooaja faasil ja põllu identiteedil. Jäljeotsija testib eraldi ka õpitavat mittelineaarset hooaja/taime kulumise kõverat, "
+                f"mis võib kajastada vananemise, lehehaiguste ja kahjurite kumulatiivset hilishooaja mõju. "
+                f"Tõestatud normaliseeritud bioloogiline koormus võib baasi korrigeerida, "
                 f"kuid toores eelmine saak, saagitrend ja muud korjeajaloo mälutunnused ei saa prognoosi ankurdada. "
                 f"XL kasutab eraldi championit: {xl_champion_name}. "
                 f"C/B kasutab eraldi championit: {cb_champion_name}. "
@@ -3285,6 +3265,9 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                     ])) if (target_day - previous_day).days > 0 else _daylength_hours(target_day),
                 }
 
+                # Õppimise ja prognoosi hooajafunktsioon peab olema identne.
+                wx.update(_season_curve_features(target_day, SEASON_START))
+
                 # Sama tuule koostoime arvutus peab olema õppimisel ja prognoosis identne.
                 # Täpselt sama mittelineaarne temperatuuribaas nagu õppimisandmestikus.
                 wx.update(_temperature_curve_features(night_all, day_all))
@@ -3318,6 +3301,41 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                         _daylength_hours(target_day - timedelta(days=i))
                         for i in range(min(n, len(rows)))
                     ]))
+
+                # 7/10/14 päeva ilmamälu: erinevalt korjevahemiku tunnustest võib see
+                # ulatuda üle eelmise korje kuupäeva. Puuduliku akna korral jääb kandidaat neutraalseks.
+                for n in (7, 10, 14):
+                    lb = []
+                    ok = True
+                    for i in range(n - 1, -1, -1):
+                        day_key = target_day - timedelta(days=i)
+                        src = all_weather_by_day.get(day_key.isoformat())
+                        clean = {}
+                        if not src:
+                            ok = False
+                            break
+                        for feature in weather_feature_names:
+                            try:
+                                value = float(src.get(feature)) if src.get(feature) is not None else None
+                            except (TypeError, ValueError):
+                                value = None
+                            if value is None:
+                                ok = False
+                                break
+                            clean[feature] = value
+                        if not ok:
+                            break
+                        lb.append(clean)
+                    if ok and len(lb) == n:
+                        wx[f"ÖöT {n}p"] = float(np.mean([r["temp_night_avg_c"] for r in lb]))
+                        wx[f"PäevT {n}p"] = float(np.mean([r["temp_day_avg_c"] for r in lb]))
+                        wx[f"Rad {n}p"] = float(np.sum([r["radiation_mj_m2"] for r in lb]))
+                        wx[f"Sade {n}p"] = float(np.sum([r["precipitation_mm"] for r in lb]))
+                        wx[f"ET0 {n}p"] = float(np.sum([r["et0_mm"] for r in lb]))
+                        wx[f"Niiskus {n}p"] = float(np.mean([r["humidity_avg_pct"] for r in lb]))
+                    else:
+                        for prefix in ("ÖöT", "PäevT", "Rad", "Sade", "ET0", "Niiskus"):
+                            wx[f"{prefix} {n}p"] = None
                 return wx, estimated_days
 
             def _champion_feature_values(state, wx):
@@ -3351,6 +3369,9 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                             "Päevapikkus", "Päevapikkus Δ7p", "Päevapikkus kasvukesk"
                         }
                         or k.startswith("Päevapikkus viim")
+                        or k == "Hooajapäev²"
+                        or k.startswith("Hooaeg ")
+                        or re.match(r"^(ÖöT|PäevT|Rad|Sade|ET0|Niiskus) (7|10|14)p$", str(k))
                     ):
                         values[k] = v
                 return [values.get(c) for c in champion_cols]
@@ -3407,29 +3428,44 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                 # eelmine sama põllu korje on päriselt mõõdetud. Kui vahepealne eelkorje on
                 # ise tulevikuprognoos, ei toida me mudelit tema enda väljundiga tagasi.
                 if champion_uses_biological_load and state.get("source") != "tegelik":
-                    # Sama põld võib 9 päeva aknas tulla uuesti korjesse. Prognoositud eelkorjet
-                    # ei kasutata järgmise korje biokoormuse sisendina.
-                    abc_extra_values = [None for _ in champion_cols]
-                    abc_mode = f"{champion_name} · koormus neutraalne"
+                    # Sama põld võib 9 päeva aknas tulla uuesti korjesse. Kui biokoormuse
+                    # champion vajaks prognoositud eelkorjet, läheme päriselt puhtale
+                    # weather-first baasmudelile, mitte championile missing-väärtustega.
+                    abc_model_used = full_abc_base_model
+                    abc_extra_values = []
+                    abc_extra_names = []
+                    abc_mode = "weather-first baasmudel · prognoositud eelkorje"
                 else:
+                    abc_model_used = full_abc_model
                     abc_extra_values = _champion_feature_values(state, wx)
+                    abc_extra_names = champion_cols
                     abc_mode = champion_name
 
                 abc_pred = _predict_full_abc_growth(
-                    full_abc_model, field_no, base_values, abc_extra_values,
+                    abc_model_used, field_no, base_values, abc_extra_values,
                 )
                 abc_explain = _abc_growth_explain(
-                    full_abc_model, field_no, base_values, abc_extra_values, champion_cols,
+                    abc_model_used, field_no, base_values, abc_extra_values, abc_extra_names,
                 )
-                xl_pred = _predict_full_generic(
-                    full_xl_model, field_no, base_values,
-                    _xl_champion_feature_values(state, wx),
-                )
-                cb_log_pred = _predict_full_generic(
-                    full_cb_model, field_no, base_values,
-                    _cb_champion_feature_values(state, wx),
-                    floor_zero=False,
-                )
+
+                if xl_champion_uses_memory and state.get("source") != "tegelik":
+                    xl_pred = _predict_full_generic(full_xl_base_model, field_no, base_values, [])
+                else:
+                    xl_pred = _predict_full_generic(
+                        full_xl_model, field_no, base_values,
+                        _xl_champion_feature_values(state, wx),
+                    )
+
+                if cb_champion_uses_memory and state.get("source") != "tegelik":
+                    cb_log_pred = _predict_full_generic(
+                        full_cb_base_model, field_no, base_values, [], floor_zero=False,
+                    )
+                else:
+                    cb_log_pred = _predict_full_generic(
+                        full_cb_model, field_no, base_values,
+                        _cb_champion_feature_values(state, wx),
+                        floor_zero=False,
+                    )
                 cb_pred = float(np.exp(np.clip(cb_log_pred, np.log(0.10), np.log(10.0))))
                 return {
                     "abc": abc_pred, "xl": xl_pred, "cb": cb_pred, "total": abc_pred + xl_pred,
@@ -3579,8 +3615,8 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                         continue
                     any_weather_imputation.update(result["estimated_days"])
                     source_label = "tegelik eelkorje" if prev["source"] == "tegelik" else "prognoositud eelkorje"
-                    if result.get("abc_mode") == "weather-first fallback":
-                        source_label += " · ABC weather-first fallback"
+                    if str(result.get("abc_mode") or "").startswith("weather-first baasmudel"):
+                        source_label += " · ABC weather-first baasmudel"
                     day_rows.append({
                         "Põld": f, "A+B+C": result["abc"], "C/B": result["cb"], "XL": result["xl"], "Kokku": result["total"],
                         "Intervall": result["interval"], "Alus": source_label,
@@ -3604,7 +3640,7 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
             # Mudeliversioon tähistab champion-valiku raamistikku, mitte tänase võitja nime.
             # Nii uuendab sama päeva rerun sama operatiivset snapshot'i ka siis, kui champion
             # uue korje järel päeva jooksul muutub. Võitja nimi salvestub basis-väljale.
-            MODEL_VERSION = "v6.4-growth-nonlinear-temp-nights-wind-daylength-v5"
+            MODEL_VERSION = "v6.4-growth-season-curve-v7-confirmed"
             forecast_payloads = []
 
             # Salvesta ka tänase päeva prognoos lead=0 snapshotina.
@@ -4079,14 +4115,15 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                     st.markdown("**Praegu parim mootor**")
                     if champion_stats:
                         st.success(
-                            f"**{champion_name}** on tänane champion. Samadel testiridadel on MAE "
+                            f"**{champion_name}** on tänane kinnitatud champion. Kandidaat valiti ainult varasemal "
+                            f"avastusperioodil; hilisem kinnitusaeg jäi valiku ajal puutumata. Kinnituses on MAE "
                             f"{champion_stats['Katse MAE']:.2f} kasti võrreldes baasi {champion_stats['Baas MAE']:.2f}-ga "
-                            f"(paranemine {champion_stats['Paranemine']:.2f}). See võitis "
-                            f"{champion_stats['Võidab ridu %']:.0f}% testiridadest ja mõju püsis ajaliselt piisavalt stabiilne."
+                            f"(paranemine {champion_stats['Paranemine']:.2f}) ning kandidaat võitis "
+                            f"{champion_stats['Võidab ridu %']:.0f}% kinnitusridadest."
                         )
                     else:
                         st.info(
-                            f"**{champion_name}** jääb championiks. Ükski lisajälg ei tõestanud täna piisavalt stabiilset eelist. "
+                            f"**{champion_name}** jääb championiks. Ükski lisajälg ei läbinud eraldi avastus- ja kinnitusetappi. "
                             f"Weather-first baasi MAE on {champion_mae:.2f} kasti."
                         )
 
@@ -4153,7 +4190,8 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                         )
                         st.caption(
                             f"Aktiivne A+B+C champion: {champion_name}. Valik arvutatakse uuesti iga uue korje järel. "
-                            "Toored saagimälu tunnused on raportis diagnostilised; normaliseeritud bioloogiline koormus võib championiks saada ainult stabiilse tõendi korral. "
+                            "Operatiivne kandidaat valitakse varasemal avastusperioodil ja peab seejärel läbima hilisema puutumata kinnituse. "
+                            "Toored saagimälu tunnused on raportis diagnostilised; normaliseeritud bioloogiline koormus võib championiks saada ainult kinnitatud tõendi korral. "
                             "Toortabel on alles kontrolliks; põhiinfo on ülal uurimisraportis."
                         )
         else:
@@ -4191,7 +4229,7 @@ if page == "Mootori tähelepanekud":
             _last_full = db.get_app_setting("idea_full_search_complete_day_count", "0")
             st.info(
                 f"Autonoomne ideegeneraator: lai uus otsing iga {IDEA_FULL_SEARCH_EVERY_COMPLETE_DAYS}. "
-                f"täieliku 3/3 korjepäeva järel. Viimane lai ring oli täielike päevade arvu {_last_full} juures. "
+                f"täieliku korjepäeva järel. Viimane lai ring oli täielike päevade arvu {_last_full} juures. "
                 "Vahepeal kontrollib tavaline Jäljeotsija olemasolevaid kandidaate."
             )
     st.caption(
