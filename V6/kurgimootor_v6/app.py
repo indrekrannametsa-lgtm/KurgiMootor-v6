@@ -1788,6 +1788,8 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                 tail = window_weather[-min(n, len(window_weather)):]
                 tmins = [_n(w.get("temp_min_c")) for w in tail]
                 tmaxs = [_n(w.get("temp_max_c")) for w in tail]
+                nights = [_n(w.get("temp_night_avg_c")) for w in tail]
+                days = [_n(w.get("temp_day_avg_c")) for w in tail]
                 mt = [(lo + hi) / 2 for lo, hi in zip(tmins, tmaxs)]
                 rad_sum = sum(_n(w.get("radiation_mj_m2")) for w in tail)
                 rain_sum = sum(_n(w.get("precipitation_mm")) for w in tail)
@@ -1798,6 +1800,8 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
 
                 return {
                     f"T viim{n}": sum(mt) / len(mt),
+                    f"ÖöT viim{n}": sum(nights) / len(nights),
+                    f"PäevT viim{n}": sum(days) / len(days),
                     f"Tmin viim{n}": sum(tmins) / len(tmins),
                     f"Tmax viim{n}": tmax_mean,
                     f"Rad viim{n}": rad_sum,
@@ -2301,7 +2305,19 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
 
             trace_results = []
             candidate_predictions = {}
-            for name, cols in {**operational_candidate_groups, **diagnostic_only_groups}.items():
+            _all_candidate_groups = {**operational_candidate_groups, **diagnostic_only_groups}
+            _missing_candidate_columns = sorted({
+                col
+                for cols in _all_candidate_groups.values()
+                for col in cols
+                if col not in model_df.columns
+            })
+            if _missing_candidate_columns:
+                raise RuntimeError(
+                    "Mudeli kandidaattunnused puuduvad õppimisandmestikust: "
+                    + ", ".join(_missing_candidate_columns)
+                )
+            for name, cols in _all_candidate_groups.items():
                 cp = _walk_forward_with_extra(cols)
                 candidate_predictions[name] = cp
                 stats = _stability_stats(cp)
