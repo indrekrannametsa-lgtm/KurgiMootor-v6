@@ -2387,8 +2387,11 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
 
             # Lai loominguline otsing: alguses iga 3 uue täieliku korjepäeva järel.
             # Vahepeal kontrollib tavaline Jäljeotsija olemasolevaid kandidaate.
+            _force_brainstorm_key = "audit_fix06_brainstorm_done"
+            _force_brainstorm_once = db.get_app_setting(_force_brainstorm_key, "0") != "1"
             AUTONOMOUS_DISCOVERY_ENABLED = bool(
-                _complete_day_count >= _last_full_idea_count + IDEA_FULL_SEARCH_EVERY_COMPLETE_DAYS
+                _force_brainstorm_once
+                or _complete_day_count >= _last_full_idea_count + IDEA_FULL_SEARCH_EVERY_COMPLETE_DAYS
             )
 
             # -------------------------------------------------------------------------
@@ -2477,6 +2480,9 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                     "Suhtarvud": 0,
                     "Ajamuutused": 0,
                     "Temperatuuriläved": 0,
+                    "Ilmamälu": 0,
+                    "Hooaeg × ilm": 0,
+                    "Bioloogiline koormus": 0,
                     "Teise ringi kombinatsioonid": 0,
                 }
 
@@ -2599,6 +2605,76 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                             np.maximum(0.0, _x - float(_thr)),
                             "Temperatuuriläved",
                         )
+
+                # 6) Pikem ilmamälu: proovi 7/10/14 päeva tunnuseid ka üksikult ja
+                # ilmastressi kombinatsioonidena. Need ulatuvad üle eelmise korje piiri,
+                # kuid EI kasuta eelmist saaki ankruna.
+                for _days in (7, 10, 14):
+                    _cols = {
+                        "ÖöT": f"ÖöT {_days}p",
+                        "PäevT": f"PäevT {_days}p",
+                        "Rad": f"Rad {_days}p",
+                        "Sade": f"Sade {_days}p",
+                        "ET0": f"ET0 {_days}p",
+                        "Niiskus": f"Niiskus {_days}p",
+                    }
+                    for _label, _col in _cols.items():
+                        if _col in model_df.columns:
+                            _register_discovery_feature(
+                                f"{_days}p {_label}",
+                                pd.to_numeric(model_df[_col], errors="coerce").to_numpy(dtype=float),
+                                "Ilmamälu",
+                            )
+                    if _cols["ÖöT"] in model_df.columns and _cols["Rad"] in model_df.columns:
+                        _register_discovery_feature(
+                            f"{_days}p ööT × radiatsioon",
+                            pd.to_numeric(model_df[_cols["ÖöT"]], errors="coerce").to_numpy(dtype=float)
+                            * pd.to_numeric(model_df[_cols["Rad"]], errors="coerce").to_numpy(dtype=float),
+                            "Ilmamälu",
+                        )
+                    if _cols["ET0"] in model_df.columns and _cols["Sade"] in model_df.columns:
+                        _register_discovery_feature(
+                            f"{_days}p veebilanss ET0−sade",
+                            pd.to_numeric(model_df[_cols["ET0"]], errors="coerce").to_numpy(dtype=float)
+                            - pd.to_numeric(model_df[_cols["Sade"]], errors="coerce").to_numpy(dtype=float),
+                            "Ilmamälu",
+                        )
+
+                # 7) Hooaja kulumine × ilm: kas sama kasvuilm annab hooaja hilisemas osas
+                # väiksema vastuse. Märki ei sunnita ette; mudel peab seose leidma.
+                _season_candidates = ["Hooajapäev²", "Hooaeg 50+", "Hooaeg 65+", "Päevapikkus"]
+                _weather_response = ["ÖöT kesk", "PäevT kesk", "Radiatsioon/p", "ET0 Σ"]
+                for _s in _season_candidates:
+                    if _s not in model_df.columns:
+                        continue
+                    _xs = pd.to_numeric(model_df[_s], errors="coerce").to_numpy(dtype=float)
+                    for _w in _weather_response:
+                        if _w not in model_df.columns:
+                            continue
+                        _xw = pd.to_numeric(model_df[_w], errors="coerce").to_numpy(dtype=float)
+                        _register_discovery_feature(
+                            f"{_s} × {_w}",
+                            _xs * _xw,
+                            "Hooaeg × ilm",
+                        )
+
+                # 8) Pikem bioloogiline koormusmälu. Kasutame ainult normaliseeritud
+                # koormusindekseid; toorest eelmist saaki ei muudeta operatiivseks ankruks.
+                _load_cols = [c for c in ["Koormusindeks -1", "2 korje koormus", "Tipukorje -1", "Tipukorje -2"] if c in model_df.columns]
+                for _c in _load_cols:
+                    _register_discovery_feature(
+                        f"Koormus: {_c}",
+                        pd.to_numeric(model_df[_c], errors="coerce").to_numpy(dtype=float),
+                        "Bioloogiline koormus",
+                    )
+                if "Koormusindeks -1" in model_df.columns and "2 korje koormus" in model_df.columns:
+                    _k1 = pd.to_numeric(model_df["Koormusindeks -1"], errors="coerce").to_numpy(dtype=float)
+                    _k2 = pd.to_numeric(model_df["2 korje koormus"], errors="coerce").to_numpy(dtype=float)
+                    _register_discovery_feature(
+                        "Koormusmälu kombineeritud",
+                        0.6 * _k1 + 0.4 * _k2,
+                        "Bioloogiline koormus",
+                    )
 
                 # Lisa kõik genereeritud tunnused DataFrame'i ühe korraga.
                 # See väldib pandas DataFrame fragmentation'it ja sadu aeglaseid insert-operatsioone.
@@ -2794,6 +2870,8 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                         "idea_full_search_last_at",
                         datetime.now(ZoneInfo("Europe/Tallinn")).isoformat(),
                     )
+                    if _force_brainstorm_once:
+                        db.set_app_setting(_force_brainstorm_key, "1")
                 except Exception as _auto_store_exc:
                     db.set_app_setting("idea_full_search_last_error", str(_auto_store_exc))
 
@@ -3656,7 +3734,7 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
             # Mudeliversioon tähistab champion-valiku raamistikku, mitte tänase võitja nime.
             # Nii uuendab sama päeva rerun sama operatiivset snapshot'i ka siis, kui champion
             # uue korje järel päeva jooksul muutub. Võitja nimi salvestub basis-väljale.
-            MODEL_VERSION = "v6.4-growth-season-curve-v7-confirmed"
+            MODEL_VERSION = "v6.4-brainstorm-v8-confirmed"
             forecast_payloads = []
 
             # Salvesta ka tänase päeva prognoos lead=0 snapshotina.
@@ -4117,16 +4195,16 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                     memory_trace = trace_df[trace_df["Jälg"].isin(memory_diagnostic_groups.keys())].copy()
                     memory_trace = memory_trace.sort_values("Paranemine", ascending=False)
 
-                    st.markdown("**Mida ma täna kaalusin**")
-                    considered = []
-                    for _, r in trace_df.sort_values("Paranemine", ascending=False).iterrows():
-                        name = r["Jälg"]
-                        role = ("weather-first kandidaat" if name in weather_candidate_groups else
-                                "bioloogilise koormuse kandidaat" if name in biological_load_candidate_groups else
-                                "uurimisjälg (ei juhi prognoosi)")
-                        considered.append(f"**{name}** — {trace_hypotheses.get(name, 'lisatunnuse võimalik mõju')} · {role}")
-                    if considered:
-                        st.markdown(";  ".join(considered) + ".")
+                    with st.expander("Mida Jäljeotsija täna kaalus"):
+                        considered = []
+                        for _, r in trace_df.sort_values("Paranemine", ascending=False).iterrows():
+                            name = r["Jälg"]
+                            role = ("weather-first kandidaat" if name in weather_candidate_groups else
+                                    "bioloogilise koormuse kandidaat" if name in biological_load_candidate_groups else
+                                    "uurimisjälg (ei juhi prognoosi)")
+                            considered.append(f"**{name}** — {trace_hypotheses.get(name, 'lisatunnuse võimalik mõju')} · {role}")
+                        if considered:
+                            st.markdown(";  ".join(considered) + ".")
 
                     st.markdown("**Praegu parim mootor**")
                     if champion_stats:
@@ -4185,15 +4263,14 @@ if page in ("Prognoos", "Mootori tähelepanekud"):
                                 f"{_why_not_stable(r)}. Uute korjetega kontrollin seda uuesti."
                             )
 
-                    rejected = trace_df[trace_df["Paranemine"] <= 0].sort_values("Paranemine", ascending=False).head(5)
+                    rejected = trace_df[trace_df["Paranemine"] <= 0].sort_values("Paranemine", ascending=False)
                     if not rejected.empty:
-                        st.markdown("**Praegu kõrvale jäetud**")
-                        for _, r in rejected.iterrows():
-                            st.write(
-                                f"• **{r['Jälg']}** — ei parandanud tänases testis baasi "
-                                f"(MAE muutus {r['Paranemine']:+.2f} kasti). See ei tähenda, et seost kindlasti pole; "
-                                "praegused andmed ei toeta selle kasutamist championis."
-                            )
+                        with st.expander(f"Praegu kõrvale jäetud ({len(rejected)})"):
+                            for _, r in rejected.iterrows():
+                                st.write(
+                                    f"• **{r['Jälg']}** — ei parandanud tänases testis baasi "
+                                    f"(MAE muutus {r['Paranemine']:+.2f} kasti)."
+                                )
 
                     with st.expander("Näita Jäljeotsija kõiki teste ja numbreid"):
                         show_trace = trace_df.copy()
