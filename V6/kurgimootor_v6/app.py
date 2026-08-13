@@ -515,8 +515,7 @@ if page == "Täna":
     # Päeva tööplaan säilitatakse andmebaasis. Nii tähendab "täielik korjepäev"
     # päriselt seda, et kõik selleks päevaks valitud põllud on sisestatud — mitte 3/3.
     saved_today_plan = db.get_harvest_plan(TODAY)
-    initial_today_plan = list(saved_today_plan) if saved_today_plan is not None else list(today_planned_fields)
-
+    initial_today_plan = list(saved_today_plan) if saved_today_plan else list(today_planned_fields)
     # Päeva vahetudes taastame salvestatud plaani; vanal/veel salvestamata päeval
     # kasutame senist automaatset põlluplaani.
     current_home_day = TODAY.isoformat()
